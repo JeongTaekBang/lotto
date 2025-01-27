@@ -7,6 +7,7 @@ from sklearn.ensemble import RandomForestRegressor
 from dotenv import load_dotenv
 from collections import Counter
 from typing import List, Tuple
+import time
 
 load_dotenv()
 
@@ -43,6 +44,13 @@ class LottoPredictor:
     def train_models(self):
         df = self.get_data()
         X, y = self.prepare_features(df)
+        random_seed = int(time.time())  # 현재 시간을 seed로
+
+        self.models = []
+        for i in range(6):
+            model = RandomForestRegressor(n_estimators=100, random_state=random_seed)
+            model.fit(X, y[:, i])
+            self.models.append(model)
 
         self.models = []
         for i in range(6):  # Train model for each position
@@ -61,14 +69,23 @@ class LottoPredictor:
         df = self.get_data()
         last_draw = df.iloc[-1].values.reshape(1, -1)
 
-        # Get model predictions
+        # seed 값 범위 조정 (0 ~ 2^32-1)
+        random_seed = int(time.time() * 1000) % (2 ** 32 - 1)
+        np.random.seed(random_seed)
+
         predictions = []
         for model in self.models:
             pred = model.predict(last_draw)[0]
-            predictions.append(round(pred))
+            noise = np.random.normal(0, 2)
+            pred = round(pred + noise)
+            predictions.append(max(1, min(45, pred)))
 
-        # Adjust predictions based on frequency
-        weights = self.get_frequency_weights()
+        while len(set(predictions)) < 6:
+            new_num = np.random.randint(1, 46)
+            if new_num not in predictions:
+                predictions[predictions.count(min(predictions))] = new_num
+
+        return sorted(list(set(predictions)))[:6]
 
         # Ensure no duplicates and numbers are within range
         final_numbers = []
