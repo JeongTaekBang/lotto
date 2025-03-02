@@ -8,20 +8,29 @@ import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 from typing import Dict, List
 
-# Load environment variables
+# .env 파일에서 환경 변수 로드
+# .env 파일 형식은 .env.example 참조
 load_dotenv()
 
 
 class LottoDBManager:
     def __init__(self):
+        # 환경 변수에서 데이터베이스 설정 로드
+        # .env 파일에 다음 변수들이 정의되어 있어야 함:
+        # DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
         self.db_config = {
             'host': os.getenv('DB_HOST'),
             'port': int(os.getenv('DB_PORT', 3306)),
             'user': os.getenv('DB_USER'),
-            'password': os.getenv('DB_PASSWORD'),
+            'password': os.getenv('DB_PASSWORD'),  # 민감 정보는 .env 파일에 저장
             'db': os.getenv('DB_NAME'),
             'cursorclass': pymysql.cursors.DictCursor
         }
+        
+        # .env 파일이 올바르게 설정되었는지 확인
+        if not self.db_config['host'] or not self.db_config['password']:
+            print("경고: 데이터베이스 설정이 올바르지 않습니다.")
+            print("README.md 파일의 '환경 설정' 섹션을 참조하여 .env 파일을 설정하세요.")
 
     def get_connection(self):
         return pymysql.connect(**self.db_config)
