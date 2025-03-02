@@ -150,10 +150,9 @@ python lotto_predict.py
 
 ## 📧 연락처
 
-프로젝트 관리자 - youremail@example.com
+프로젝트 관리자 - bjt0709@gmail.com
 
-프로젝트 링크: [https://github.com/yourusername/lotto-ai-prediction](https://github.com/yourusername/lotto-ai-prediction)
-
+프로젝트 링크: https://github.com/JeongTaekBang/lotto
 ---
 
 ⭐ 이 프로젝트가 유용하다고 생각되면 별표를 눌러주세요!
