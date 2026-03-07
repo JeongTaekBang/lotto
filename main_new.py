@@ -343,7 +343,7 @@ def cmd_crawl(args):
     try:
         from crawling import LottoCrawler
         crawler = LottoCrawler()
-        crawler.update_latest()
+        crawler.crawl_latest()
     except ImportError:
         print("crawling.py 모듈을 찾을 수 없습니다.")
 
