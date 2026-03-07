@@ -111,6 +111,7 @@ logs/
 mlruns/
 *.pth
 *.png
+!analysis/output/*.png
 *.pdf
 
 # Model binaries
