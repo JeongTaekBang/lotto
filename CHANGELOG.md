@@ -4,6 +4,28 @@
 
 ---
 
+## [2.1.0] - 2026-03-20
+
+CNN Grid 모델을 v2로 업그레이드. 패턴 인식 능력 강화 및 학습 안정성 개선.
+
+### Added
+- **CBAM (Channel + Spatial Attention)**: 각 CNN branch와 fusion에 적용하여 중요한 채널/위치에 집중
+- **Temporal Attention**: 20개 타임스텝에 learnable weight 적용, 최근 회차에 recency bias 초기화
+- **Residual Connections**: 모든 branch + fusion + FC head에 skip connection 추가
+- **Focal Loss** (alpha=0.75, gamma=2.0): 6/45 class imbalance 해결, 당첨 번호(positive)에 3배 가중
+- **V1 호환 로딩**: `model_version` 키로 자동 분기, 기존 cnn_grid.pt 로드 가능
+- **구 V2 체크포인트 마이그레이션**: BatchNorm→LayerNorm 전환 시 state_dict 키 자동 변환
+
+### Changed
+- CNN Grid 네트워크: `LottoCNNGridNet` (v2) 전면 교체, 기존은 `LottoCNNGridNetV1`으로 보존
+- 5x5, 1x1 branch에 두 번째 conv layer 추가 (deeper feature extraction)
+- FC Head: `Linear→ReLU→Dropout→Linear` → `Linear→LayerNorm→ReLU→Dropout→Linear→LayerNorm→ReLU→(residual)→Dropout→Linear`
+- FC 정규화: BatchNorm1d → LayerNorm (batch size=1에서도 학습 가능)
+- 파라미터: ~97K → ~146K (1.5x, 여전히 lightweight)
+- 테스트: 16개 → 39개
+
+---
+
 ## [2.0.0] - 2026-03-07
 
 멀티 모델 앙상블 시스템으로 전면 재구축. 단일 스크립트(`lotto_predict.py`) 구조에서 모듈화된 OOP 아키텍처로 전환.

@@ -39,10 +39,13 @@ class ModelEvaluator:
         if model_name is None:
             model_name = model.model_type
 
+        total = len(X)
+        if total == 0:
+            raise ValueError(f"평가 데이터가 비어 있습니다 (model: {model_name})")
+
         hits_dist = {i: 0 for i in range(7)}
         perfect_matches = []
         high_hits = []
-        total = len(X)
 
         for i in range(total):
             sample = X[i:i+1]

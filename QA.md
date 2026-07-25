@@ -25,7 +25,7 @@
 | **GRU** | 딥러닝 (RNN) | LSTM의 경량화 버전, 시퀀스 패턴 학습 |
 | **Transformer** | 딥러닝 (Attention) | 장기 의존성 학습, Self-Attention |
 | **LSTM** | 딥러닝 (RNN) | 시퀀스 패턴 학습, 장기 기억 |
-| **CNN Grid** | 딥러닝 (CNN) | 7x7 공간 패턴 학습, 멀티 브랜치 |
+| **CNN Grid** | 딥러닝 (CNN) | 7x7 공간 패턴 학습, 멀티 브랜치, CBAM+Residual+Temporal Attention (v2) |
 | **XGBoost** | 머신러닝 (Boosting) | Gradient Boosting, 45개 이진분류기 |
 | **RandomForest** | 머신러닝 (Ensemble) | 다수 결정트리 앙상블 |
 | **Markov** | 통계 모델 | 전이확률 기반 예측 |
@@ -139,6 +139,25 @@
 
 이렇게 하면 "최근 20회차 동안 7x7 격자의 어느 칸이 얼마나 자주 켜졌는지"가 하나의 이미지에 담깁니다.
 
+#### 1.5단계: Temporal Attention (v2 추가)
+
+20장의 사진을 쌓기 전에, **"어느 회차가 더 중요한지"** 자동으로 학습합니다.
+
+```
+20회차 사진 스택
+  1194회 (오래된) ← 가중치 낮음
+  1195회          ← ...
+  ...
+  1213회 (최근)   ← 가중치 높음
+
+Temporal Attention:
+  - 각 타임스텝에 learnable weight 적용
+  - 초기값: 최근 회차에 높은 가중치 (recency bias)
+  - 학습하면서 "어떤 과거가 예측에 유용한지" 자동 조정
+```
+
+최근 데이터가 더 중요하다는 상식을 초기값으로 반영하되, 학습을 통해 모델이 스스로 최적의 시간 가중치를 찾습니다.
+
 #### 2단계: 3개 카메라(브랜치)가 서로 다른 패턴을 탐색
 
 CNN이 사진에서 고양이를 찾을 때 작은 필터로 눈/코/귀를 감지하듯, 3가지 크기의 필터가 격자 위 서로 다른 패턴을 찾습니다.
@@ -173,15 +192,37 @@ Branch 3 - 1x1 필터 (현미경): "특정 칸의 시계열"
           42번이 15회째 미출현 (콜드넘버)
 ```
 
+**v2 개선사항:** 각 branch가 conv 2개(v1은 3x3만 2개, 나머지는 1개)로 더 깊은 특징을 추출하며, **Residual Connection**(skip connection)으로 gradient가 잘 흐릅니다.
+
+#### 2.5단계: CBAM Attention (v2 추가)
+
+각 branch의 결과에 **CBAM(Convolutional Block Attention Module)**이 적용됩니다.
+
+```
+CBAM = Channel Attention + Spatial Attention
+
+Channel Attention: "어떤 필터가 찾은 패턴이 중요한가?"
+  32개 필터 중 → "3번 필터가 찾은 대각선 패턴이 제일 유용하네"
+  → 중요한 채널 강조, 불필요한 채널 억제
+
+Spatial Attention: "격자의 어느 위치가 중요한가?"
+  7x7 격자 중 → "중앙 영역(15~28번)의 패턴이 더 유의미하네"
+  → 중요한 위치 강조, 패딩 영역(46~49번) 자동 억제
+```
+
+CBAM은 각 branch 출력과 fusion 출력에 적용됩니다 (총 4개).
+
 #### 3단계: 합성 → 확률 출력
 
 ```
 3x3 결과 (32채널, 7x7) ─┐
+  + Residual + CBAM       │
                           ├→ concat (80채널, 7x7)
 5x5 결과 (32채널, 7x7) ──┤        ↓
-                          │   Fusion Conv (64채널, 7x7)
+  + Residual + CBAM       │   Fusion Conv (64채널, 7x7)
+                          │   + Residual + CBAM
 1x1 결과 (16채널, 7x7) ──┘        ↓
-                          Global Average Pooling
+  + Residual + CBAM       Global Average Pooling
                                    ↓
                              64차원 벡터
                                    ↓
@@ -191,7 +232,11 @@ Branch 3 - 1x1 필터 (현미경): "특정 칸의 시계열"
                      │  → FC로 32차원으로 압축       │
                      └─────────────┬──────────────┘
                                    ↓
-                        FC 128 → Dropout → FC 45
+                     FC 128 → LayerNorm → ReLU → Dropout
+                                   ↓
+                     FC 128 → LayerNorm → ReLU + Residual
+                                   ↓
+                          Dropout → FC 45
                                    ↓
                           Sigmoid (0~1)
                                    ↓
@@ -225,7 +270,27 @@ grids = padded.reshape(..., 7, 7) # (batch, 20, 7, 7) ← 이미지 완성!
 
 45개 번호를 49개(=7x7)로 zero-pad한 뒤 reshape하면 끝입니다. 46~49번째 칸은 항상 0인 더미 픽셀입니다.
 
-**모델 사양:** ~97K 파라미터 (경량), Extended 74차원 지원
+#### 손실 함수: Focal Loss (v2)
+
+v1의 BCELoss 대신 **Focal Loss**를 사용합니다. 로또 예측에서 45개 번호 중 6개만 당첨(13.3%)이므로 극심한 class imbalance가 있습니다.
+
+```
+Focal Loss 핵심:
+  loss = -α_t × (1 - p_t)^γ × log(p_t)
+
+  α (alpha=0.75): 당첨 번호에 3배 가중치
+    → 당첨 번호 놓치는 것 > 미당첨 번호 틀리는 것
+
+  γ (gamma=2.0): "쉬운 예측"의 loss를 줄임
+    → 확실한 미당첨(p≈0)은 무시하고, 헷갈리는 번호에 집중
+
+비유:
+  BCELoss = 45명 학생 시험을 동일하게 채점
+  Focal Loss = 당첨 후보 6명의 시험을 3배 엄격하게 채점
+              + 확실히 떨어진 학생은 채점도 안 함
+```
+
+**모델 사양:** ~146K 파라미터 (v1의 1.5배, 여전히 경량), Extended 74차원 지원
 
 ```bash
 # 학습
@@ -771,4 +836,4 @@ _MODELS['my_model'] = lambda cfg: MyModel(cfg)
 
 ---
 
-*마지막 업데이트: 2026-03-07*
+*마지막 업데이트: 2026-03-20*

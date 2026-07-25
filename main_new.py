@@ -164,13 +164,10 @@ def cmd_predict(args):
         else:
             manager.set_strategy(WeightedAverageEnsemble())
 
-        # 자동 가중치 계산 (성능 기반)
+        # 자동 가중치 계산 (성능 기반, 테스트셋만 사용)
         if args.auto_weight:
             print("\n성능 기반 자동 가중치 계산 중...")
-            X, y = trainer.prepare_sequences()
-            # 최근 100회차로 평가
-            eval_size = min(100, len(X))
-            X_eval, y_eval = X[-eval_size:], y[-eval_size:]
+            X_eval, y_eval = _get_test_data(trainer, 100)
             weights = manager.auto_weight_by_performance(
                 X_eval, y_eval,
                 method=args.weight_method,
@@ -229,8 +226,25 @@ def cmd_predict(args):
         print(f"\n앙상블: {args.strategy}, 가중치: {weight_info}, 필터: {args.filter or bool(args.mode)}")
 
 
+def _get_test_data(trainer, args_rounds, test_ratio=0.1):
+    """학습에 사용되지 않은 테스트 데이터만 반환 (데이터 누수 방지)"""
+    X, y = trainer.prepare_sequences()
+    split_idx = int(len(X) * (1 - test_ratio))
+    X_test, y_test = X[split_idx:], y[split_idx:]
+
+    if len(X_test) == 0:
+        raise ValueError("테스트 데이터가 비어 있습니다. 학습 데이터가 충분한지 확인하세요.")
+
+    # 요청 라운드가 유효한 양수이고 테스트셋보다 작으면 뒤에서 잘라냄
+    if 0 < args_rounds < len(X_test):
+        X_test = X_test[-args_rounds:]
+        y_test = y_test[-args_rounds:]
+
+    return X_test, y_test
+
+
 def cmd_evaluate(args):
-    """모델 평가 (백테스팅)"""
+    """모델 평가 (백테스팅) - 학습 데이터 제외, 테스트셋만 사용"""
     print("=" * 60)
     print("모델 평가 (백테스팅)")
     print("=" * 60)
@@ -261,10 +275,8 @@ def cmd_evaluate(args):
             feature_mode='extended',
             use_bonus=args.bonus
         )
-        X_ext, y_ext = trainer_ext.prepare_sequences()
-        if args.rounds < len(X_ext):
-            X_ext = X_ext[-args.rounds:]
-            y_ext = y_ext[-args.rounds:]
+        X_ext, y_ext = _get_test_data(trainer_ext, args.rounds)
+        print(f"\n[평가] 테스트셋: {len(X_ext)}회차 (학습 데이터 제외)")
 
         for model_name in extended_models:
             try:
@@ -294,10 +306,8 @@ def cmd_evaluate(args):
             feature_mode='basic',
             use_bonus=args.bonus
         )
-        X_basic, y_basic = trainer_basic.prepare_sequences()
-        if args.rounds < len(X_basic):
-            X_basic = X_basic[-args.rounds:]
-            y_basic = y_basic[-args.rounds:]
+        X_basic, y_basic = _get_test_data(trainer_basic, args.rounds)
+        print(f"\n[평가] 테스트셋: {len(X_basic)}회차 (학습 데이터 제외)")
 
         for model_name in basic_models:
             try:
@@ -369,6 +379,14 @@ def cmd_list(args):
         print(f"  - {name}")
 
 
+def _positive_int(value):
+    """argparse용 양의 정수 검증"""
+    ivalue = int(value)
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(f"양의 정수를 입력하세요 (입력값: {value})")
+    return ivalue
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="로또 예측 시스템 - 멀티 모델 아키텍처",
@@ -416,7 +434,7 @@ def main():
     # evaluate
     eval_parser = subparsers.add_parser('evaluate', help='모델 평가')
     eval_parser.add_argument('--model', type=str, default='transformer', help='평가할 모델')
-    eval_parser.add_argument('--rounds', type=int, default=100, help='평가할 회차 수')
+    eval_parser.add_argument('--rounds', type=_positive_int, default=100, help='평가할 회차 수 (양수)')
     eval_parser.add_argument('--seq-length', type=int, default=20)
     eval_parser.add_argument('--feature-mode', type=str, default='basic',
                             choices=['basic', 'extended', 'xgboost'],
@@ -426,7 +444,7 @@ def main():
 
     # compare
     compare_parser = subparsers.add_parser('compare', help='모델 비교')
-    compare_parser.add_argument('--rounds', type=int, default=100)
+    compare_parser.add_argument('--rounds', type=_positive_int, default=100)
     compare_parser.add_argument('--seq-length', type=int, default=20)
     compare_parser.add_argument('--feature-mode', type=str, default='basic',
                                choices=['basic', 'extended', 'xgboost'],

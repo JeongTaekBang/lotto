@@ -120,3 +120,5 @@ model.pt
 
 # Claude Code
 .claude/
+# Windows conda environment check output from a manual run.
+_test_output4.txt
