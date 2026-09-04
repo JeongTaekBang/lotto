@@ -118,7 +118,8 @@ mlruns/
 saved_models/
 model.pt
 
-# Claude Code
-.claude/
+# Claude Code (local state stays ignored; Forrest's hooks file is tracked)
+.claude/*
+!.claude/settings.json
 # Windows conda environment check output from a manual run.
 _test_output4.txt
