@@ -1,0 +1,40 @@
+{
+  "schema_version": 3,
+  "task_id": "bd2f0ed4-e512-437e-8f38-68bec07d4db9",
+  "slug": "lotto",
+  "name": "lotto",
+  "source_ref": null,
+  "branch": "main",
+  "agents": [
+    "codex",
+    "claude_code"
+  ],
+  "registration": "adopted",
+  "context_binding": {
+    "host_kind": "git_repository",
+    "context_key": "app:lotto"
+  },
+  "integration": {
+    "bundle_version": 19,
+    "scaffold_version": 1,
+    "managed_hashes": {
+      ".claude/settings.json": "1b9b3ad9048fb540adae1acde0feefc0eb7bd6e500eeee7fd43a4e933d2a4cc6",
+      ".codex/hooks.json": "47dd8289a5c6436d1e90632377cb4ed604918ab0e7a74aa9c67109f79f84c305",
+      ".forrest/session_start.py": "fe039d4bc7d85df5fc14af3da000c5afd93a6f010ef2a5f916cfb391c10b9879",
+      "AGENTS.md": "b6cc7808d5dae970c18516727d06e1b2470d9ae71dc9e3dabfaa94db8d09b22d",
+      "CLAUDE.md": "0b3f59d0d05f787573bca25d5439aff456cfebf6ae1aeb0aacf0fe8d1120a333",
+      "tools/coop/coop.py": "138ac69b24640d5992ffc06c6b32ddd4bfcb8f0a26475c1d07f95b264c87179e"
+    },
+    "guard_hashes": {
+      ".claude/settings.json": "68d83509b28d1832272e789f69c2099c1105f5d0a68afa2cd82643bbe59cfc75",
+      ".codex/hooks.json": "0491effc14e6dd6b7d2a6a59876b5e3d7b6c8b00c237aa641d7cca4640a5cf68",
+      ".forrest/session_start.py": "fe039d4bc7d85df5fc14af3da000c5afd93a6f010ef2a5f916cfb391c10b9879",
+      "AGENTS.md": "a8428eb495ed0c214f6dee40c344dff869685a894f60997087de72f2cfcc1244",
+      "CLAUDE.md": "0227535bcdc951a736393b1cbd0a141ad33aa2d2eba421f941e2f00dabc77265",
+      "tools/coop/coop.py": "138ac69b24640d5992ffc06c6b32ddd4bfcb8f0a26475c1d07f95b264c87179e"
+    },
+    "scaffold_hashes": {
+      "PROJECT_BRIEF.md": "cc7b996cecf6b7377b5459f9477fd85cb25f3d02d05c7eee48381fac16da28c4"
+    }
+  }
+}

@@ -106,3 +106,7 @@ lotto.bat      # Windows
 4. **Explain Changes**: High-level summary at each step
 5. **Document Results**: Add review section to `tasks/todo.md`
 6. **Capture Lessons**: Update `tasks/lessons.md` after corrections
+
+<!-- BEGIN:forrest-project-protocol -->
+@AGENTS.md
+<!-- END:forrest-project-protocol -->

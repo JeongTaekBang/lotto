@@ -1,0 +1,40 @@
+{
+  "description": "Load the active Forrest identity and registered project context.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.forrest/session_start.py\" --agent codex",
+            "timeout": 30,
+            "statusMessage": "Loading Forrest identity and project context",
+            "additionalContextLimit": 0
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ \"${FORREST_WORKSPACE:-}\" = \"1\" ]; then if [ -z \"${FORREST_WORK_HOOK:-}\" ]; then echo \"Forrest managed tool hook is unavailable\" >&2; exit 2; fi; python3 \"$FORREST_WORK_HOOK\"; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ \"${FORREST_WORKSPACE:-}\" = \"1\" ]; then if [ -z \"${FORREST_WORK_HOOK:-}\" ]; then echo \"Forrest managed tool hook is unavailable\" >&2; exit 2; fi; python3 \"$FORREST_WORK_HOOK\"; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
