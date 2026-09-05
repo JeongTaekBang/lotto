@@ -29,23 +29,24 @@ python main_new.py predict --ensemble --auto-weight  # 앙상블 예측
 ## 설치
 
 ```bash
-# 필요한 패키지 설치
-pip install torch numpy pymysql python-dotenv requests beautifulsoup4 lxml
-
-# 멀티 모델용 추가 패키지
-pip install xgboost scikit-learn
+conda activate lotto
+pip install -r requirements.txt
 ```
 
 ## 환경 설정
 
-`.env` 파일 생성:
+당첨번호 데이터는 [bjt-blog](https://github.com/JeongTaekBang/bjt-blog) 저장소의
+`data/lotto.db`(SQLite)를 **읽기 전용**으로 사용합니다. 별도의 DB 서버가 필요 없습니다.
+
+기본 경로는 이 저장소 기준 `../bjt-blog/data/lotto.db`이며, 다른 위치에 두었다면
+`.env` 파일이나 환경변수로 지정합니다:
+
 ```
-DB_HOST=localhost
-DB_PORT=3306
-DB_USER=your_username
-DB_PASSWORD=your_password
-DB_NAME=lotto
+LOTTO_DB_PATH=/path/to/bjt-blog/data/lotto.db
 ```
+
+DB보다 최신 회차가 동행복권에 있으면 실행 시 API로 **메모리에만** 보충하며,
+블로그 저장소의 DB 파일은 절대 변경하지 않습니다. 보충을 끄려면 `--no-fetch`를 씁니다.
 
 ## lotto.bat 메뉴
 
@@ -60,7 +61,7 @@ DB_NAME=lotto
   [4] Train - All Models           # 6개 모델 학습 (XGBoost 제외)
   [5] Compare Models               # 모델 성능 비교
   [6] Backtest                     # 백테스팅
-  [7] Crawl Data                   # 데이터 크롤링
+  [7] Check Data Status            # DB·API 회차 차이 확인 + 블로그 저장소 갱신
   [8] Statistics                   # 통계 분석
   [0] Exit
 ```
@@ -108,9 +109,13 @@ python main_new.py compare --rounds=100       # 전체 모델 비교
 python main_new.py evaluate --model=xgboost   # 단일 모델 평가
 
 # 유틸리티
-python main_new.py list     # 모델 목록
-python main_new.py crawl    # 데이터 크롤링
-python main_new.py analyze  # 통계 분석
+python main_new.py list               # 모델 목록
+python main_new.py crawl              # DB·API 회차 차이 확인 + 블로그 저장소 git pull --ff-only
+python main_new.py crawl --no-pull    # 상태 확인만
+python main_new.py analyze            # 통계 분석
+
+# 데이터 옵션
+--no-fetch   # DB보다 최신인 회차를 API로 보충하지 않음 (train/predict/evaluate/compare)
 ```
 
 ## 프로젝트 구조
@@ -176,12 +181,14 @@ lotto/
 
 ## 데이터베이스
 
-테이블: `lotto`
+bjt-blog 저장소의 SQLite 파일 `data/lotto.db`, 테이블 `draws` (읽기 전용)
 
 | 필드 | 설명 |
 |------|------|
-| count | 회차 |
-| 1~6 | 당첨번호 |
-| 7 | 보너스번호 |
-| person | 당첨자 수 |
-| amount | 당첨금액 |
+| round | 회차 |
+| draw_date | 추첨일 (YYYY-MM-DD) |
+| n1~n6 | 당첨번호 |
+| bonus | 보너스번호 |
+| rank1_winners | 1등 당첨자 수 |
+| rank1_amount | 1등 1인당 당첨금 |
+| total_sales | 회차 총 판매액 |

@@ -83,7 +83,7 @@ echo   [3] Train - Single Model
 echo   [4] Train - All Models
 echo   [5] Compare Models
 echo   [6] Backtest
-echo   [7] Crawl Data
+echo   [7] Check Data Status
 echo   [8] Statistics
 echo   [9] CNN Grid Visual (Predict + Dashboard)
 echo   [0] Exit
@@ -285,10 +285,10 @@ goto menu
 :crawl
 cls
 echo ==================================================
-echo        Crawl Data
+echo        Check Data Status
 echo ==================================================
 echo.
-echo [Crawling latest lottery data...]
+echo [Checking DB/API round gap and updating the blog repo...]
 echo.
 "%PYTHON%" "%SCRIPT%" crawl
 echo.

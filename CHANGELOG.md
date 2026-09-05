@@ -4,6 +4,33 @@
 
 ---
 
+## [2.2.0] - 2026-09-05
+
+데이터 소스를 AWS MySQL에서 bjt-blog 저장소의 SQLite 파일로 전환. DB 서버와 자격증명 없이 동작한다.
+
+### Added
+- **`SQLiteDataSource`** (`datasources/sqlite_source.py`): bjt-blog `data/lotto.db`의 `draws` 테이블을 읽는 데이터 소스
+  - 경로 결정: 생성자 인자 → `LOTTO_DB_PATH` 환경변수 → 기본값 `../bjt-blog/data/lotto.db`(저장소 루트 기준)
+  - `sqlite3` URI `mode=ro` 연결로 블로그 DB 파일에 대한 쓰기를 원천 차단
+  - DB보다 최신 회차가 동행복권 API에 있으면 빠진 회차만 **메모리에서** 보충 (연속성이 끊기면 중단)
+  - 파일 부재 시 절대 경로를 포함한 `FileNotFoundError`
+- `--no-fetch` 옵션 (train/predict/evaluate/compare): API 보충 비활성화
+- `--no-pull` 옵션 (crawl): 블로그 저장소 갱신 생략
+- `BaseDataSource.get_raw_data()`: MySQL 전용이던 헬퍼를 베이스 클래스로 이동
+- `tests/test_sqlite_source.py`: 스키마 파싱·정렬·winners/prize 매핑·경로 결정·API 보충·읽기 전용 보장 검증 (21개)
+
+### Changed
+- `main_new.py crawl`: MySQL INSERT 대신 DB·API 회차 차이를 보고하고 블로그 저장소에서 `git pull --ff-only` 시도
+- `main_new.py`, `analysis/statistics_report.py`, `analysis/visualize_grid.py`, `scripts_xgboost_mode.py`가 `SQLiteDataSource` 사용
+- `.env`는 선택 사항이 되었고 `LOTTO_DB_PATH`만 담는다
+
+### Removed
+- `datasources/mysql_source.py` — `datasources/sqlite_source.py`로 대체
+- `crawling.py` — `main_new.py crawl`이 상태 보고 + 블로그 저장소 갱신으로 대체
+- MySQL 드라이버 의존성 (`requirements.txt`) 및 `.env.example`의 DB 접속 정보 항목 5개
+
+---
+
 ## [2.1.0] - 2026-03-20
 
 CNN Grid 모델을 v2로 업그레이드. 패턴 인식 능력 강화 및 학습 안정성 개선.

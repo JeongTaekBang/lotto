@@ -7,17 +7,18 @@
     python main_new.py predict [--model=MODEL] [--ensemble] [--sets=N]
     python main_new.py evaluate [--model=MODEL] [--rounds=N]
     python main_new.py compare [--rounds=N]
-    python main_new.py crawl
+    python main_new.py crawl [--no-pull]
     python main_new.py analyze
 """
 import sys
 import os
 import argparse
+import subprocess
 
 # 경로 설정
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from datasources.mysql_source import MySQLDataSource
+from datasources.sqlite_source import SQLiteDataSource
 from models.factory import ModelFactory
 from training.trainer import UnifiedTrainer
 from training.evaluator import ModelEvaluator
@@ -28,6 +29,11 @@ from filters.pattern_filter import PatternFilter
 from filters.statistical_filter import StatisticalFilter
 from filters.frequency_filter import FrequencyFilter
 from filters.composite_filter import CompositeFilter
+
+
+def _make_datasource(args) -> SQLiteDataSource:
+    """CLI 인자로부터 데이터 소스 생성 (--no-fetch 시 API 보충 비활성화)"""
+    return SQLiteDataSource(fetch_missing=not getattr(args, 'no_fetch', False))
 
 
 def get_feature_mode(args) -> str:
@@ -46,7 +52,7 @@ def cmd_train(args):
     print("=" * 60)
 
     # 데이터 소스
-    datasource = MySQLDataSource()
+    datasource = _make_datasource(args)
 
     # 모델 및 피처 모드 결정
     models_to_train = []
@@ -110,7 +116,7 @@ def cmd_predict(args):
     print("로또 번호 예측")
     print("=" * 60)
 
-    datasource = MySQLDataSource()
+    datasource = _make_datasource(args)
 
     # 피처 모드 자동 결정
     if args.ensemble:
@@ -249,7 +255,7 @@ def cmd_evaluate(args):
     print("모델 평가 (백테스팅)")
     print("=" * 60)
 
-    datasource = MySQLDataSource()
+    datasource = _make_datasource(args)
 
     # 모델별 피처 모드 결정 (학습 시와 동일하게)
     # XGBoost: basic (45차원), 나머지: extended (74차원)
@@ -344,18 +350,67 @@ def cmd_compare(args):
     cmd_evaluate(args)
 
 
-def cmd_crawl(args):
-    """최신 데이터 크롤링"""
-    print("=" * 60)
-    print("최신 당첨번호 크롤링")
-    print("=" * 60)
+def _pull_blog_repo(db_path):
+    """블로그 저장소에서 git pull --ff-only 시도 (실패해도 종료 코드는 정상)"""
+    repo_dir = db_path.parent.parent  # <repo>/data/lotto.db -> <repo>
+    print(f"\n[블로그 저장소 갱신] {repo_dir}")
+
+    if not (repo_dir / '.git').exists():
+        print("  git 저장소가 아니어서 건너뜁니다.")
+        return
 
     try:
-        from crawling import LottoCrawler
-        crawler = LottoCrawler()
-        crawler.crawl_latest()
-    except ImportError:
-        print("crawling.py 모듈을 찾을 수 없습니다.")
+        result = subprocess.run(
+            ['git', '-C', str(repo_dir), 'pull', '--ff-only'],
+            capture_output=True, text=True, timeout=120
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"  git pull 실행 실패: {e}")
+        return
+
+    for line in (result.stdout + result.stderr).strip().splitlines():
+        print(f"  {line}")
+
+    if result.returncode != 0:
+        print(f"  git pull --ff-only 실패 (exit {result.returncode}) — 기존 DB 파일을 그대로 사용합니다.")
+
+
+def cmd_crawl(args):
+    """당첨번호 데이터 상태 확인 (DB·API 회차 차이 보고 + 블로그 저장소 갱신)"""
+    print("=" * 60)
+    print("당첨번호 데이터 상태 확인")
+    print("=" * 60)
+
+    # 상태 확인 단계에서는 API 보충 없이 DB 원본만 읽는다
+    source = SQLiteDataSource(fetch_missing=False)
+    print(f"DB 경로: {source.db_path}")
+
+    try:
+        records = source.load()
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[오류] {e}")
+        return
+
+    db_last = records[-1].round_num if records else 0
+    api_last = source.fetch_latest_round()
+
+    print(f"\nDB 마지막 회차: {db_last}")
+    if api_last is None:
+        print("동행복권 최신 회차: 확인 실패")
+    else:
+        print(f"동행복권 최신 회차: {api_last}")
+        gap = api_last - db_last
+        if gap > 0:
+            print(f"  -> DB에 {gap}회차 부족 ({db_last + 1}~{api_last}). "
+                  f"예측 시 API로 메모리 보충됩니다 (--no-fetch로 비활성화).")
+        else:
+            print("  -> DB가 최신 상태입니다.")
+
+    if args.no_pull:
+        print("\n[건너뜀] --no-pull 지정으로 블로그 저장소 갱신을 생략합니다.")
+        return
+
+    _pull_blog_repo(source.db_path)
 
 
 def cmd_analyze(args):
@@ -407,6 +462,8 @@ def main():
                              help='피처 모드: basic(45), extended(74), xgboost(66)')
     train_parser.add_argument('--extended', action='store_true', help='(deprecated) --feature-mode=extended')
     train_parser.add_argument('--bonus', action='store_true', help='보너스 번호 피처 사용')
+    train_parser.add_argument('--no-fetch', action='store_true',
+                             help='DB보다 최신인 회차를 API로 보충하지 않음')
 
     # predict
     predict_parser = subparsers.add_parser('predict', help='번호 예측')
@@ -430,6 +487,8 @@ def main():
                                help='피처 모드: basic(45), extended(74), xgboost(66)')
     predict_parser.add_argument('--extended', action='store_true', help='(deprecated)')
     predict_parser.add_argument('--bonus', action='store_true')
+    predict_parser.add_argument('--no-fetch', action='store_true',
+                               help='DB보다 최신인 회차를 API로 보충하지 않음')
 
     # evaluate
     eval_parser = subparsers.add_parser('evaluate', help='모델 평가')
@@ -441,6 +500,8 @@ def main():
                             help='피처 모드: basic(45), extended(74), xgboost(66)')
     eval_parser.add_argument('--extended', action='store_true', help='(deprecated)')
     eval_parser.add_argument('--bonus', action='store_true')
+    eval_parser.add_argument('--no-fetch', action='store_true',
+                            help='DB보다 최신인 회차를 API로 보충하지 않음')
 
     # compare
     compare_parser = subparsers.add_parser('compare', help='모델 비교')
@@ -451,9 +512,13 @@ def main():
                                help='피처 모드: basic(45), extended(74), xgboost(66)')
     compare_parser.add_argument('--extended', action='store_true', help='(deprecated)')
     compare_parser.add_argument('--bonus', action='store_true')
+    compare_parser.add_argument('--no-fetch', action='store_true',
+                               help='DB보다 최신인 회차를 API로 보충하지 않음')
 
     # crawl
-    subparsers.add_parser('crawl', help='최신 데이터 크롤링')
+    crawl_parser = subparsers.add_parser('crawl', help='데이터 상태 확인 및 블로그 저장소 갱신')
+    crawl_parser.add_argument('--no-pull', action='store_true',
+                              help='블로그 저장소 git pull --ff-only 생략')
 
     # analyze
     subparsers.add_parser('analyze', help='통계 분석')

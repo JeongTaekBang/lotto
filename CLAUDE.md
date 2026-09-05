@@ -30,7 +30,8 @@ python main_new.py compare --rounds=100         # Compare all models
 python main_new.py evaluate --model=gru --rounds=100
 
 # Utilities
-python main_new.py crawl                        # Crawl latest draw data
+python main_new.py crawl                        # Report DB/API round gap + git pull the blog repo
+python main_new.py crawl --no-pull              # Status check only
 python main_new.py analyze                      # Statistics report
 python main_new.py list                         # List available models
 python analysis/visualize_grid.py               # CNN Grid visualization (4 PNGs)
@@ -81,11 +82,14 @@ lotto.bat      # Windows
 - Filters (Composite Pattern): `PatternFilter`, `StatisticalFilter`, `FrequencyFilter` -> `CompositeFilter`
 
 ### Data Pipeline
-- `MySQLDataSource` (`datasources/mysql_source.py`): Reads from MySQL `lotto` table (columns: `count`, `1`-`6`, `7` bonus)
+- `SQLiteDataSource` (`datasources/sqlite_source.py`): **Read-only** reader for the bjt-blog repo's SQLite file (`draws` table: `round`, `draw_date`, `n1`-`n6`, `bonus`, `rank1_winners`, `rank1_amount`, `total_sales`)
+  - Path resolution: constructor arg -> `LOTTO_DB_PATH` env var -> default `../bjt-blog/data/lotto.db` (relative to repo root)
+  - Opens the DB with a `mode=ro` URI, so the blog's file is never written
+  - When the dhlottery API (`selectPstLt645Info.do`) is ahead of the DB, missing rounds are supplemented **in memory only**; disable with `--no-fetch` / `fetch_missing=False`
 - `FeatureExtractor` (`core/feature_extractor.py`): Converts records to feature vectors
 - `UnifiedTrainer` (`training/trainer.py`): Handles sequence preparation, train/val split, model creation
-- `crawling.py`: Scrapes latest draw results into DB
-- Requires `.env` with `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD`, `DB_NAME`
+- `main_new.py crawl`: Reports the DB/API round gap and runs `git pull --ff-only` in the blog repo (`--no-pull` to skip). It never writes to the DB itself.
+- No DB server or `.env` credentials required; `.env` is optional and only holds `LOTTO_DB_PATH`
 
 ### Adding a New Model
 1. Create `models/my_model.py`, subclass `BaseModel`

@@ -17,14 +17,14 @@ from scipy import stats
 from collections import Counter, defaultdict
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from datasources.mysql_source import MySQLDataSource
+from datasources.sqlite_source import SQLiteDataSource
 
 
 class LottoStatistics:
     """로또 번호 통계 분석 클래스"""
 
     def __init__(self):
-        self.datasource = MySQLDataSource()
+        self.datasource = SQLiteDataSource()
         self.numbers = None
         self.rounds = None
 

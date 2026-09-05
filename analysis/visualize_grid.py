@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.patches import Rectangle
 
-from datasources.mysql_source import MySQLDataSource
+from datasources.sqlite_source import SQLiteDataSource
 from models.factory import ModelFactory
 from training.trainer import UnifiedTrainer
 
@@ -62,7 +62,7 @@ def draw_grid(ax, grid, title, cmap='Blues', show_numbers=True, vmin=0, vmax=1,
 
 def main():
     # --- 데이터 로드 ---
-    ds = MySQLDataSource()
+    ds = SQLiteDataSource()
     records = ds.load()
     last_round = records[-1].round_num
 

@@ -83,6 +83,21 @@ class BaseDataSource(ABC):
         bonus = np.array([r.bonus for r in self._records])
         return numbers, bonus
 
+    def get_raw_data(self) -> np.ndarray:
+        """
+        원본 형태의 2차원 배열로 변환
+
+        Returns:
+            (N, 8) 배열 - [회차, 번호1~6, 보너스]
+        """
+        if not self._loaded:
+            self.load()
+
+        return np.array([
+            [rec.round_num] + rec.numbers + [rec.bonus]
+            for rec in self._records
+        ])
+
     def to_multihot(self, include_bonus: bool = False) -> np.ndarray:
         """
         Multi-hot 인코딩으로 변환

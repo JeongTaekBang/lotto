@@ -3,13 +3,13 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from datasources.mysql_source import MySQLDataSource
+from datasources.sqlite_source import SQLiteDataSource
 from training.trainer import UnifiedTrainer
 from models.factory import ModelFactory
 import numpy as np
 
 def test_model(feature_mode, dim):
-    datasource = MySQLDataSource()
+    datasource = SQLiteDataSource()
     trainer = UnifiedTrainer(datasource, seq_length=20, feature_mode=feature_mode)
     X, y = trainer.prepare_sequences()
 

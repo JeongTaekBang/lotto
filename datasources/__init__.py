@@ -1,4 +1,4 @@
 # Data sources module
-from .mysql_source import MySQLDataSource
+from .sqlite_source import SQLiteDataSource
 
-__all__ = ['MySQLDataSource']
+__all__ = ['SQLiteDataSource']
