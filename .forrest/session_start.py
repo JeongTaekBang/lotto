@@ -432,7 +432,11 @@ def _record_terminal_session_receipt(
                 "vault_root": str(vault),
                 "soul_entry": str(soul_entry),
                 "identity_source": identity_source,
-                "source": _payload_text(payload, "source") or "unknown",
+                # SessionStart carries a source (startup/resume/clear/
+                # compact); a UserPromptSubmit payload has none, so name
+                # the writing event instead of reporting "unknown".
+                "source": _payload_text(payload, "source")
+                or ("prompt" if event_name == "UserPromptSubmit" else "unknown"),
                 "started_at": (
                     str(existing.get("started_at") or now)
                     if existing is not None
