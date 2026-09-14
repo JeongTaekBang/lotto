@@ -15,20 +15,20 @@
     "context_key": "app:lotto"
   },
   "integration": {
-    "bundle_version": 21,
+    "bundle_version": 22,
     "scaffold_version": 1,
     "managed_hashes": {
-      ".claude/settings.json": "1b9b3ad9048fb540adae1acde0feefc0eb7bd6e500eeee7fd43a4e933d2a4cc6",
+      ".claude/settings.json": "0a7b94ee835a65da7b08ce5a17a793a0b54da0123fb39db8a3cc5efca4aabbb2",
       ".codex/hooks.json": "47dd8289a5c6436d1e90632377cb4ed604918ab0e7a74aa9c67109f79f84c305",
-      ".forrest/session_start.py": "ddca36831efa1020cfa7e01b06686c7a24f09e5617092beb8bd67c234d6531ce",
+      ".forrest/session_start.py": "c7fe1b2a8c6ab820a2f07945d38fad43a825a26e544ea30929d9dc9e14ea54fd",
       "AGENTS.md": "5f07d5c40c11978b4c26368c3c20a10785f0755d75357f00a2b3160255950560",
       "CLAUDE.md": "4641fe2446dbff0b63136798b5835a2610de0e3a83133ae4dda8392d22fcbd69",
       "tools/coop/coop.py": "138ac69b24640d5992ffc06c6b32ddd4bfcb8f0a26475c1d07f95b264c87179e"
     },
     "guard_hashes": {
-      ".claude/settings.json": "68d83509b28d1832272e789f69c2099c1105f5d0a68afa2cd82643bbe59cfc75",
+      ".claude/settings.json": "d251c3e45f42a955642ffa23c1aab00b07d72c8358b3725c4ae23ab44421f599",
       ".codex/hooks.json": "0491effc14e6dd6b7d2a6a59876b5e3d7b6c8b00c237aa641d7cca4640a5cf68",
-      ".forrest/session_start.py": "ddca36831efa1020cfa7e01b06686c7a24f09e5617092beb8bd67c234d6531ce",
+      ".forrest/session_start.py": "c7fe1b2a8c6ab820a2f07945d38fad43a825a26e544ea30929d9dc9e14ea54fd",
       "AGENTS.md": "941fa0f01024f6bb9908d6659ae18e650dfc331683c2441f3c24379896cb9474",
       "CLAUDE.md": "0227535bcdc951a736393b1cbd0a141ad33aa2d2eba421f941e2f00dabc77265",
       "tools/coop/coop.py": "138ac69b24640d5992ffc06c6b32ddd4bfcb8f0a26475c1d07f95b264c87179e"

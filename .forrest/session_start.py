@@ -11,6 +11,12 @@ The hook is deliberately fail-open. A broken optional identity note must not
 prevent a terminal from opening, while a missing soul entry, missing
 instructions file, an unusable existing core note, or unavailable Coop
 database is made conspicuous in the model-visible output.
+
+Claude Code also runs this script at ``UserPromptSubmit``. That run prints
+nothing and only writes the terminal-session receipt: Claude Code (notably the
+Desktop app's warm-up) fires ``SessionStart`` for phantom sessions that never
+receive a prompt or a transcript (anthropics/claude-code#78455), so a receipt
+written at ``SessionStart`` would count sessions that never existed.
 """
 
 from __future__ import annotations
@@ -32,6 +38,13 @@ _PROJECT_BRIEF_MAX_BYTES = 16 * 1024
 _COOP_MAX_BYTES = 16 * 1024
 _SKIP_PREFIXES = ("_", ".")
 _RUNTIME_CONTEXT_FILENAME = "runtime-context.json"
+# Which hook event pins the terminal receipt. Claude Code waits for the first
+# prompt because its SessionStart also fires for phantom/warm-up sessions;
+# Codex has no such phantom and no prompt hook in the kit, so it stays at birth.
+_RECEIPT_HOOK_EVENT_BY_AGENT = {
+    "claude-code": "UserPromptSubmit",
+    "codex": "SessionStart",
+}
 _RUNTIME_CONTEXT_SCHEMA_VERSION = 1
 _HOOK_PAYLOAD_MAX_BYTES = 1024 * 1024
 # Claude Code keeps at most this many characters of SessionStart stdout in
@@ -146,7 +159,13 @@ def _managed_hooks(content: bytes, relative: str) -> bytes:
     hooks = parsed.get("hooks") if isinstance(parsed, dict) else None
     expected_agent = "claude-code" if relative.startswith(".claude") else "codex"
     event_names = (
-        ("SessionStart", "PreToolUse", "PostToolUse", "PostToolUseFailure")
+        (
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+        )
         if relative.startswith(".claude")
         else ("SessionStart", "PreToolUse", "PostToolUse")
     )
@@ -162,7 +181,7 @@ def _managed_hooks(content: bytes, relative: str) -> bytes:
                 command = item.get("command")
                 if not isinstance(command, str):
                     continue
-                if event_name == "SessionStart":
+                if event_name in ("SessionStart", "UserPromptSubmit"):
                     matches = (
                         ".forrest/session_start.py" in command
                         and f"--agent {expected_agent}" in command
@@ -183,7 +202,7 @@ def _managed_hooks(content: bytes, relative: str) -> bytes:
 
 
 def _read_hook_payload() -> dict[str, object]:
-    """Read the one SessionStart payload without blocking manual invocations."""
+    """Read the one hook payload without blocking manual invocations."""
     if sys.stdin.isatty():
         return {}
     raw = sys.stdin.buffer.read(_HOOK_PAYLOAD_MAX_BYTES + 1)
@@ -292,15 +311,23 @@ def _record_terminal_session_receipt(
 ) -> Path | None:
     """Publish metadata only; transcript reading belongs to backend sleep.
 
-    A receipt pins the Soul selected at session birth. It contains the native
+    A receipt pins the Soul selected for a session. It contains the native
     transcript path but never opens that path and never writes the Soul vault.
     Managed WorkUnits are excluded because their completed result already
     returns to the canonical-home conversation JSONL.
+
+    The event that may write it depends on the agent
+    (``_RECEIPT_HOOK_EVENT_BY_AGENT``): a Claude Code receipt waits for the
+    first ``UserPromptSubmit`` so phantom SessionStart-only sessions leave
+    nothing behind. A missing ``hook_event_name`` counts as ``SessionStart``.
     """
     if not _terminal_capture_enabled() or _managed_work_environment():
         return None
-    event_name = _payload_text(payload, "hook_event_name", "hookEventName")
-    if event_name and event_name != "SessionStart":
+    event_name = (
+        _payload_text(payload, "hook_event_name", "hookEventName")
+        or "SessionStart"
+    )
+    if event_name != _RECEIPT_HOOK_EVENT_BY_AGENT.get(agent):
         return None
     provider_by_agent = {
         "claude-code": "claude_code",
@@ -1189,6 +1216,23 @@ def main() -> int:
     except Exception as exc:
         hook_payload = {}
         print(f"FORREST SESSION PAYLOAD UNAVAILABLE: {exc}")
+    if _payload_text(hook_payload, "hook_event_name", "hookEventName") == (
+        "UserPromptSubmit"
+    ):
+        # First real prompt: pin the receipt and stay silent. Anything printed
+        # here would enter the model's context on every prompt, and a
+        # non-zero exit would erase the user's prompt.
+        try:
+            _record_terminal_session_receipt(
+                hook_payload,
+                agent=str(args.agent),
+            )
+        except Exception as exc:
+            print(
+                f"FORREST TERMINAL CAPTURE RECEIPT UNAVAILABLE: {exc}",
+                file=sys.stderr,
+            )
+        return 0
     try:
         _record_managed_session_identity(hook_payload)
     except Exception as exc:
