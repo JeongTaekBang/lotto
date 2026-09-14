@@ -17,7 +17,7 @@ Council/global source receives a server-minted default-Soul home. Editable
 ordinary terminal uses the current runtime-selected/default Soul and does not
 pin, bind, or adopt project identity.
 It pins only that selected Soul in a metadata receipt for bounded idle return
-to the Soul's `memory/inbox/`; full transcript Adopt stays explicit.
+to the Soul's staging inbox under Forrest's app data; full transcript Adopt stays explicit.
 
 Confirm startup output contains `<forrest-terminal-context>`. If it did not
 run, execute the shared bootstrap explicitly:

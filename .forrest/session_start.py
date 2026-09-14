@@ -34,6 +34,14 @@ _SKIP_PREFIXES = ("_", ".")
 _RUNTIME_CONTEXT_FILENAME = "runtime-context.json"
 _RUNTIME_CONTEXT_SCHEMA_VERSION = 1
 _HOOK_PAYLOAD_MAX_BYTES = 1024 * 1024
+# Claude Code keeps at most this many characters of SessionStart stdout in
+# context. Above it the whole output is written to a tool-results file and only
+# a 2,000-character preview reaches the model (observed on Claude Code 2.1.270,
+# 2026-09-14; tracked upstream as anthropics/claude-code#44086). Codex hooks run
+# with additionalContextLimit=0 and keep the full bootstrap.
+_HOST_CONTEXT_MAX_CHARS = {"claude-code": 10_000}
+_HOST_CONTEXT_MARGIN_CHARS = 1_000
+_DEMOTABLE_LABEL_PREFIXES = ("core/", "shared core/", "PROJECT_BRIEF.md")
 _TERMINAL_RECEIPT_SCHEMA_VERSION = 1
 _TERMINAL_RECEIPT_DIRECTORY = "terminal-sessions"
 _TERMINAL_CAPTURE_OFF = frozenset({"0", "false", "no", "off"})
@@ -319,6 +327,7 @@ def _record_terminal_session_receipt(
         soul_entry,
         profile,
         _shared,
+        _shared_root,
         identity_source,
         _warnings,
     ) = _identity_source()
@@ -547,11 +556,25 @@ def _profile_projection(
     return profile
 
 
+def _shared_root(value: object, warnings: list[str]) -> Path | None:
+    """Read a published shared owner without guessing from the Soul root."""
+    if value is None:
+        return None  # Additive descriptor field; older descriptors have none.
+    try:
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            raise ValueError("expected an absolute shared vault path")
+        return Path(value).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        warnings.append(f"SHARED SOUL CORE ROOT UNAVAILABLE: {exc}")
+        return None
+
+
 def _identity_source() -> tuple[
     Path,
     Path | None,
     dict[str, str] | None,
     str | None,
+    Path | None,
     str,
     list[str],
 ]:
@@ -567,13 +590,13 @@ def _identity_source() -> tuple[
         root = Path(work_root or ".").expanduser().resolve()
         source = f"managed WorkUnit Soul {work_soul_id or '<missing>'}"
         if not (work_root and work_entry and work_soul_id):
-            return root, None, None, None, source, [
+            return root, None, None, None, None, source, [
                 "MANAGED WORKUNIT SOUL IDENTITY INCOMPLETE: refusing to mix "
                 "it with the global Soul.",
             ]
         entry = Path(work_entry).expanduser().resolve()
         if entry != root and root not in entry.parents:
-            return root, None, None, None, source, [
+            return root, None, None, None, None, source, [
                 "MANAGED WORKUNIT SOUL ENTRY ESCAPED ITS VAULT: identity "
                 "entry was not loaded.",
             ]
@@ -592,7 +615,10 @@ def _identity_source() -> tuple[
             work_warnings.append(
                 "MANAGED WORKUNIT SHARED SOUL INSTRUCTIONS UNAVAILABLE."
             )
-        return root, entry, profile, shared or None, source, work_warnings
+        shared_root = _shared_root(
+            os.environ.get("FORREST_WORK_SHARED_VAULT_ROOT"), work_warnings,
+        )
+        return root, entry, profile, shared or None, shared_root, source, work_warnings
 
     descriptor = _runtime_context_path()
     warnings: list[str] = []
@@ -631,7 +657,8 @@ def _identity_source() -> tuple[
                 "ACTIVE SHARED SOUL INSTRUCTIONS UNAVAILABLE: runtime "
                 "descriptor predates the shared projection."
             )
-        return root, soul, profile, shared or None, str(descriptor), warnings
+        shared_root = _shared_root(payload.get("shared_vault_root"), warnings)
+        return root, soul, profile, shared or None, shared_root, str(descriptor), warnings
     except (
         FileNotFoundError,
         OSError,
@@ -663,7 +690,7 @@ def _identity_source() -> tuple[
     else:
         soul = None
     fallback = "FORREST_VAULT_ROOT" if raw else "default ~/Forrest"
-    return root, soul, None, None, fallback, warnings
+    return root, soul, None, None, None, fallback, warnings
 
 
 def _soul_entry(root: Path, configured: Path | None = None) -> Path:
@@ -729,6 +756,7 @@ def _identity_sections(
     configured_soul: Path | None = None,
     profile: dict[str, str] | None = None,
     shared_instructions: str | None = None,
+    shared_root: Path | None = None,
 ) -> tuple[list[str], list[str]]:
     entry = _soul_entry(root, configured_soul)
     profile_body = "\n".join(
@@ -754,55 +782,66 @@ def _identity_sections(
             (shared_instructions or "").strip(),
             "CRITICAL: shared Soul instructions are unavailable",
         ),
-        (
-            "instructions.md — soul operational delta",
-            str(root / "instructions.md"),
-            _read(root / "instructions.md", owner_root=root),
-            "CRITICAL: active soul instructions are unavailable: "
-            f"{root / 'instructions.md'}",
-        ),
     ]
     core_warnings: list[str] = []
-    core = root / "core"
-    if core.is_dir():
-        resolved_core = _owned_path(core, root)
-        if resolved_core is None:
-            core_warnings.append(
-                "CRITICAL: active soul core directory escaped its vault: "
-                f"{core}"
-            )
-        else:
-            try:
-                core_paths = sorted(resolved_core.rglob("*.md"))
-            except OSError as exc:
-                core_paths = []
-                core_warnings.append(
-                    f"CRITICAL: active soul core could not be enumerated: "
-                    f"{core} ({exc})"
-                )
-            for path in core_paths:
-                if path.name.startswith(_SKIP_PREFIXES):
-                    continue
-                candidates.append((
-                    path.relative_to(root.resolve()).as_posix(),
-                    str(path),
-                    _read(path, owner_root=root),
-                    "CRITICAL: active soul core note is unavailable or "
-                    f"outside its vault: {path}",
-                ))
+    shared_start = len(candidates)
+    if shared_root is not None:
+        shared_candidates, shared_warnings = _core_candidates(
+            shared_root, kind="shared soul",
+        )
+        candidates.extend(shared_candidates)
+        core_warnings.extend(shared_warnings)
+    shared_end = len(candidates)
+    candidates.append((
+        "instructions.md — soul operational delta",
+        str(root / "instructions.md"),
+        _read(root / "instructions.md", owner_root=root),
+        "CRITICAL: active soul instructions are unavailable: "
+        f"{root / 'instructions.md'}",
+    ))
+    local_candidates, local_warnings = _core_candidates(root)
+    candidates.extend(local_candidates)
+    core_warnings.extend(local_warnings)
 
+    rendered_candidates = [
+        f"--- {label} ({source}) ---\n{body}" if body else ""
+        for label, source, body, _warning in candidates
+    ]
+    # Budget priority differs from inheritance order. Shared core may use
+    # only bytes left after the pre-existing Soul spine, while still appearing
+    # before its overrides. Counting a two-byte separator per section against
+    # budget + 2 also handles a missing entry/profile without an off-by-two.
+    spine_bytes = sum(
+        len(rendered.encode("utf-8")) + 2
+        for index, rendered in enumerate(rendered_candidates)
+        if rendered and not shared_start <= index < shared_end
+    )
+    shared_budget = max(0, _IDENTITY_MAX_BYTES + 2 - spine_bytes)
     sections: list[str] = []
     warnings: list[str] = core_warnings
     used = 0
+    shared_omission_warned = False
     for index, (label, source, body, missing_warning) in enumerate(candidates):
         if not body:
             if missing_warning is not None:
                 warnings.append(missing_warning)
             continue
-        rendered = f"--- {label} ({source}) ---\n{body}"
+        rendered = rendered_candidates[index]
+        is_shared = shared_start <= index < shared_end
         separator_bytes = 2 if sections else 0
         remaining = _IDENTITY_MAX_BYTES - used - separator_bytes
+        if is_shared:
+            remaining = min(remaining, shared_budget - 2)
         if remaining <= 0:
+            if is_shared:
+                if not shared_omission_warned:
+                    warnings.append(
+                        "Shared core byte budget omitted file(s) to preserve "
+                        f"the Soul's own instructions/core; read {shared_root / 'core'} "
+                        "for the complete shared layer."
+                    )
+                    shared_omission_warned = True
+                continue
             omitted = [
                 candidate_label
                 for candidate_label, _source, _body, _warning in candidates[index:]
@@ -816,6 +855,13 @@ def _identity_sections(
         bounded = _clip(rendered, remaining, source=source)
         sections.append(bounded)
         used += separator_bytes + len(bounded.encode("utf-8"))
+        if is_shared:
+            shared_budget -= len(bounded.encode("utf-8")) + 2
+            if bounded != rendered:
+                warnings.append(
+                    f"Shared core note bounded to preserve Soul overrides: {source}"
+                )
+            continue
         if bounded != rendered:
             omitted = [
                 candidate_label
@@ -830,6 +876,40 @@ def _identity_sections(
                 )
             break
     return sections, warnings
+
+
+def _core_candidates(
+    root: Path, *, kind: str = "active soul",
+) -> tuple[list[tuple[str, str, str, str | None]], list[str]]:
+    """Fresh, sorted, owner-contained core reads for both inheritance layers."""
+    candidates: list[tuple[str, str, str, str | None]] = []
+    warnings: list[str] = []
+    core = root / "core"
+    if not core.is_dir():
+        return candidates, warnings
+    resolved_core = _owned_path(core, root)
+    if resolved_core is None:
+        return candidates, [
+            f"CRITICAL: {kind} core directory escaped its vault: {core}",
+        ]
+    try:
+        core_paths = sorted(resolved_core.rglob("*.md"))
+    except OSError as exc:
+        return candidates, [
+            f"CRITICAL: {kind} core could not be enumerated: {core} ({exc})",
+        ]
+    for path in core_paths:
+        if path.name.startswith(_SKIP_PREFIXES):
+            continue
+        rel = path.relative_to(root.resolve()).as_posix()
+        label = f"shared {rel}" if kind == "shared soul" else rel
+        candidates.append((
+            label,
+            str(path),
+            _read(path, owner_root=root),
+            f"CRITICAL: {kind} core note is unavailable or outside its vault: {path}",
+        ))
+    return candidates, warnings
 
 
 def _project_overlay(repo_root: Path) -> tuple[str, list[str]]:
@@ -872,12 +952,133 @@ def _coop_brief(repo_root: Path, agent: str) -> tuple[str, list[str]]:
     )
 
 
+def _split_section(section: str) -> tuple[str, str, str]:
+    """Return (label, source, body) for one ``--- label (source) ---`` section."""
+    first, _, body = section.partition("\n")
+    head = first.strip()
+    if not (head.startswith("--- ") and head.endswith(" ---")):
+        return head, "", body
+    inner = head[4:-4]
+    if inner.endswith(")") and " (" in inner:
+        label, _, source = inner[:-1].rpartition(" (")
+        return label, source, body
+    return inner, "", body
+
+
+def _demotable(section: str) -> bool:
+    label, source, _body = _split_section(section)
+    return (
+        label.startswith(_DEMOTABLE_LABEL_PREFIXES)
+        and bool(source)
+        and Path(source).is_absolute()
+    )
+
+
+def _clip_chars(text: str, max_chars: int, *, source: str) -> str:
+    if len(text) <= max_chars:
+        return text
+    notice = f"\n\n[bounded at {max_chars} characters; rerun or read {source}]"
+    if len(notice) >= max_chars:
+        return notice[:max_chars]
+    return text[: max_chars - len(notice)].rstrip() + notice
+
+
+def _read_first_block(demoted: list[tuple[str, str, int]], limit: int) -> str:
+    lines = [
+        "--- always-on self not inlined (host limit) ---",
+        f"Claude Code keeps at most {limit:,} characters of SessionStart output in",
+        "context; a larger bootstrap is replaced by a 2,000-character preview. The",
+        "files below are part of the always-on identity the WebUI loads every turn.",
+        "Read each one with the Read tool before your first reply, in this order,",
+        "and do not answer from this bootstrap alone:",
+    ]
+    for index, (label, source, chars) in enumerate(demoted, start=1):
+        lines.append(f"{index}. {source} — {label} ({chars:,} chars)")
+    lines.append(
+        "index/, playbook/, memory/, and library/ stay on demand as "
+        "instructions.md directs."
+    )
+    return "\n".join(lines)
+
+
+def _assemble(
+    header: str,
+    warnings: list[str],
+    demoted: list[tuple[str, str, int]],
+    sections: list[str],
+    coop: str,
+    *,
+    limit: int | None,
+) -> str:
+    parts = [header]
+    if warnings:
+        parts.append("--- bootstrap warnings ---\n" + "\n".join(warnings))
+    if demoted and limit is not None:
+        parts.append(_read_first_block(demoted, limit))
+    parts.extend(sections)
+    if coop:
+        parts.append(coop)
+    parts.append("</forrest-terminal-context>")
+    return "\n\n".join(parts)
+
+
+def _fit_host_context(
+    agent: str,
+    header: str,
+    warnings: list[str],
+    sections: list[str],
+    coop: str,
+) -> str:
+    """Keep the bootstrap inside what the host actually injects.
+
+    Later layers yield first (project overlay, then core notes in reverse
+    load order); each demoted file is named in a read-first block placed
+    before the inline sections so that even a preview still carries the map.
+    The Soul entry, registry, shared boundary, and instructions stay inline.
+    """
+    limit = _HOST_CONTEXT_MAX_CHARS.get(agent)
+    demoted: list[tuple[str, str, int]] = []
+    if limit is None:
+        return _assemble(header, warnings, demoted, sections, coop, limit=None)
+    budget = limit - _HOST_CONTEXT_MARGIN_CHARS
+    sections = list(sections)
+
+    def current() -> str:
+        return _assemble(header, warnings, demoted, sections, coop, limit=limit)
+
+    while len(current()) > budget:
+        index = next(
+            (i for i in range(len(sections) - 1, -1, -1) if _demotable(sections[i])),
+            None,
+        )
+        if index is None:
+            break
+        label, source, body = _split_section(sections[index])
+        demoted.insert(0, (label, source, len(body)))
+        del sections[index]
+    if len(current()) > budget and coop:
+        excess = len(current()) - budget
+        coop = _clip_chars(
+            coop,
+            max(0, len(coop) - excess),
+            source="`python3 tools/coop/coop.py brief --agent " + agent + "`",
+        )
+    rendered = current()
+    if len(rendered) > limit:
+        # Last resort: never hand the host something it will replace with a
+        # preview. The cut is visible and names where the rest lives.
+        closer = "\n\n[bounded at the host limit; read instructions.md and core/ from the vault]\n\n</forrest-terminal-context>"
+        rendered = rendered[: limit - len(closer)].rstrip() + closer
+    return rendered
+
+
 def render(agent: str, repo_root: Path, *, body: str = "registered-app") -> str:
     (
         vault,
         configured_soul,
         soul_profile,
         shared_instructions,
+        shared_root,
         identity_source,
         warnings,
     ) = _identity_source()
@@ -886,6 +1087,7 @@ def render(agent: str, repo_root: Path, *, body: str = "registered-app") -> str:
         configured_soul,
         soul_profile,
         shared_instructions,
+        shared_root,
     )
     warnings.extend(identity_warnings)
     coop, coop_warnings = _coop_brief(repo_root, agent)
@@ -931,6 +1133,14 @@ Forrest still works here with you, but the binder is gone:
         )
     else:
         raise ValueError(f"unsupported Forrest terminal body: {body}")
+    host_limit = _HOST_CONTEXT_MAX_CHARS.get(agent)
+    host_line = (
+        f"\n- Host limit: {agent} keeps at most {host_limit:,} characters of this"
+        "\n  bootstrap in context; always-on files that do not fit are listed"
+        "\n  first for you to Read before your first reply."
+        if host_limit is not None
+        else ""
+    )
     header = f"""<forrest-terminal-context>
 {standing}
 
@@ -942,19 +1152,12 @@ Forrest still works here with you, but the binder is gone:
   for an empty inbox; restore access and rerun the brief before project work.
 - Keep WebUI identity injection separate. This terminal bootstrap must never be
   enabled as a setting source inside Forrest's WebUI SDK turns.
-- Agent surface: {agent}
+- Agent surface: {agent}{host_line}
 """.rstrip()
-    parts = [header]
-    if warnings:
-        parts.append("--- bootstrap warnings ---\n" + "\n".join(warnings))
-    parts.extend(identity)
+    sections = list(identity)
     if overlay:
-        parts.append(overlay)
-    if coop:
-        parts.append(coop)
-    parts.append("</forrest-terminal-context>")
-    return "\n\n".join(parts)
-
+        sections.append(overlay)
+    return _fit_host_context(agent, header, warnings, sections, coop)
 
 def main() -> int:
     parser = argparse.ArgumentParser()
