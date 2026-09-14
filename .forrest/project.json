@@ -15,7 +15,7 @@
     "context_key": "app:lotto"
   },
   "integration": {
-    "bundle_version": 20,
+    "bundle_version": 21,
     "scaffold_version": 1,
     "managed_hashes": {
       ".claude/settings.json": "1b9b3ad9048fb540adae1acde0feefc0eb7bd6e500eeee7fd43a4e933d2a4cc6",
