@@ -12,11 +12,12 @@ prevent a terminal from opening, while a missing soul entry, missing
 instructions file, an unusable existing core note, or unavailable Coop
 database is made conspicuous in the model-visible output.
 
-Claude Code also runs this script at ``UserPromptSubmit``. That run prints
-nothing and only writes the terminal-session receipt: Claude Code (notably the
-Desktop app's warm-up) fires ``SessionStart`` for phantom sessions that never
-receive a prompt or a transcript (anthropics/claude-code#78455), so a receipt
-written at ``SessionStart`` would count sessions that never existed.
+The bootstrap is a SessionStart product. Any other hook event exits silently
+and writes nothing: bundles 22-23 shipped a ``UserPromptSubmit`` hook for a
+terminal-session receipt that has had no reader since 2026-09-18, and Claude
+Code snapshots its hooks when a session opens, so a session older than bundle
+24 keeps calling this script on every prompt. Printing there would re-inject
+the whole identity into the model's context each turn.
 """
 
 from __future__ import annotations
@@ -38,13 +39,6 @@ _PROJECT_BRIEF_MAX_BYTES = 16 * 1024
 _COOP_MAX_BYTES = 16 * 1024
 _SKIP_PREFIXES = ("_", ".")
 _RUNTIME_CONTEXT_FILENAME = "runtime-context.json"
-# Which hook event pins the terminal receipt. Claude Code waits for the first
-# prompt because its SessionStart also fires for phantom/warm-up sessions;
-# Codex has no such phantom and no prompt hook in the kit, so it stays at birth.
-_RECEIPT_HOOK_EVENT_BY_AGENT = {
-    "claude-code": "UserPromptSubmit",
-    "codex": "SessionStart",
-}
 _RUNTIME_CONTEXT_SCHEMA_VERSION = 1
 _HOOK_PAYLOAD_MAX_BYTES = 1024 * 1024
 # Claude Code keeps at most this many characters of SessionStart stdout in
@@ -55,9 +49,6 @@ _HOOK_PAYLOAD_MAX_BYTES = 1024 * 1024
 _HOST_CONTEXT_MAX_CHARS = {"claude-code": 10_000}
 _HOST_CONTEXT_MARGIN_CHARS = 1_000
 _DEMOTABLE_LABEL_PREFIXES = ("core/", "shared core/", "PROJECT_BRIEF.md")
-_TERMINAL_RECEIPT_SCHEMA_VERSION = 1
-_TERMINAL_RECEIPT_DIRECTORY = "terminal-sessions"
-_TERMINAL_CAPTURE_OFF = frozenset({"0", "false", "no", "off"})
 _FORREST_PROTOCOL_BEGIN = "<!-- BEGIN:forrest-project-protocol -->"
 _FORREST_PROTOCOL_END = "<!-- END:forrest-project-protocol -->"
 _GUARDED_PATHS = (
@@ -159,13 +150,7 @@ def _managed_hooks(content: bytes, relative: str) -> bytes:
     hooks = parsed.get("hooks") if isinstance(parsed, dict) else None
     expected_agent = "claude-code" if relative.startswith(".claude") else "codex"
     event_names = (
-        (
-            "SessionStart",
-            "UserPromptSubmit",
-            "PreToolUse",
-            "PostToolUse",
-            "PostToolUseFailure",
-        )
+        ("SessionStart", "PreToolUse", "PostToolUse", "PostToolUseFailure")
         if relative.startswith(".claude")
         else ("SessionStart", "PreToolUse", "PostToolUse")
     )
@@ -181,7 +166,7 @@ def _managed_hooks(content: bytes, relative: str) -> bytes:
                 command = item.get("command")
                 if not isinstance(command, str):
                     continue
-                if event_name in ("SessionStart", "UserPromptSubmit"):
+                if event_name == "SessionStart":
                     matches = (
                         ".forrest/session_start.py" in command
                         and f"--agent {expected_agent}" in command
@@ -272,207 +257,12 @@ def _record_managed_session_identity(payload: dict[str, object]) -> None:
     )
 
 
-def _fsync_directory(path: Path) -> None:
-    fd = os.open(str(path), os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _terminal_capture_enabled() -> bool:
-    raw = os.environ.get("FORREST_TERMINAL_CAPTURE", "").strip().casefold()
-    return raw not in _TERMINAL_CAPTURE_OFF
-
-
-def _managed_work_environment() -> bool:
-    return any(
-        os.environ.get(key, "").strip()
-        for key in (
-            "FORREST_WORK_SESSION_FILE",
-            "FORREST_WORK_TASK_ID",
-            "FORREST_WORKSPACE",
-        )
-    )
-
-
 def _payload_text(payload: dict[str, object], *keys: str) -> str:
     for key in keys:
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
-
-
-def _record_terminal_session_receipt(
-    payload: dict[str, object],
-    *,
-    agent: str,
-) -> Path | None:
-    """Publish metadata only; transcript reading belongs to backend sleep.
-
-    A receipt pins the Soul selected for a session. It contains the native
-    transcript path but never opens that path and never writes the Soul vault.
-    Managed WorkUnits are excluded because their completed result already
-    returns to the canonical-home conversation JSONL.
-
-    The event that may write it depends on the agent
-    (``_RECEIPT_HOOK_EVENT_BY_AGENT``): a Claude Code receipt waits for the
-    first ``UserPromptSubmit`` so phantom SessionStart-only sessions leave
-    nothing behind. A missing ``hook_event_name`` counts as ``SessionStart``.
-    """
-    if not _terminal_capture_enabled() or _managed_work_environment():
-        return None
-    event_name = (
-        _payload_text(payload, "hook_event_name", "hookEventName")
-        or "SessionStart"
-    )
-    if event_name != _RECEIPT_HOOK_EVENT_BY_AGENT.get(agent):
-        return None
-    provider_by_agent = {
-        "claude-code": "claude_code",
-        "codex": "codex_rollout",
-    }
-    provider = provider_by_agent.get(agent)
-    if provider is None:
-        return None
-
-    session_id = _payload_text(
-        payload, "session_id", "sessionId", "thread_id", "threadId",
-    )
-    transcript_raw = _payload_text(payload, "transcript_path", "transcriptPath")
-    cwd_raw = _payload_text(payload, "cwd")
-    if not session_id or len(session_id) > 200:
-        return None
-    if not transcript_raw or len(transcript_raw) > 4096:
-        return None
-    if not cwd_raw or len(cwd_raw) > 4096:
-        return None
-
-    (
-        vault,
-        soul_entry,
-        profile,
-        _shared,
-        _shared_root,
-        identity_source,
-        _warnings,
-    ) = _identity_source()
-    descriptor = _runtime_context_path()
-    if identity_source != str(descriptor) or profile is None:
-        return None
-    soul_id = str(profile.get("soul_id") or "").strip()
-    if not soul_id or soul_entry is None:
-        return None
-
-    transcript = Path(transcript_raw).expanduser().resolve()
-    cwd = Path(cwd_raw).expanduser().resolve()
-    vault = vault.resolve()
-    soul_entry = soul_entry.resolve()
-    if soul_entry != vault and vault not in soul_entry.parents:
-        return None
-
-    db_raw = os.environ.get("FORREST_DB_ROOT", "").strip()
-    db_root = (
-        Path(db_raw).expanduser().resolve()
-        if db_raw
-        else (Path.home() / "forrest-db").resolve()
-    )
-    receipts = db_root / _TERMINAL_RECEIPT_DIRECTORY
-    receipts_existed = receipts.is_dir()
-    receipts.mkdir(parents=True, exist_ok=True)
-    if not receipts_existed:
-        _fsync_directory(receipts.parent)
-    digest = _sha256(f"{provider}:{session_id}".encode("utf-8"))[:24]
-    target = receipts / f"{provider}-{digest}.json"
-    # One directory lock is shared with the backend retire/quarantine path.
-    # A per-receipt lock would itself leak one inode for every completed CLI
-    # session after the JSON receipt is retired.
-    lock_path = receipts / ".lock"
-    now = _now_iso()
-
-    with lock_path.open("a+b") as lock_handle:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        try:
-            existing: dict[str, object] | None = None
-            if target.exists():
-                value = json.loads(target.read_text(encoding="utf-8"))
-                if not isinstance(value, dict):
-                    raise ValueError("terminal session receipt is invalid")
-                existing = value
-                pinned = (
-                    str(existing.get("provider") or ""),
-                    str(existing.get("session_id") or ""),
-                    str(existing.get("soul_id") or ""),
-                    str(existing.get("vault_root") or ""),
-                    str(existing.get("transcript_path") or ""),
-                    str(existing.get("cwd") or ""),
-                )
-                current = (
-                    provider,
-                    session_id,
-                    soul_id,
-                    str(vault),
-                    str(transcript),
-                    str(cwd),
-                )
-                if pinned != current:
-                    raise ValueError(
-                        "terminal session resumed with different pinned context"
-                    )
-
-            record = {
-                "schema_version": _TERMINAL_RECEIPT_SCHEMA_VERSION,
-                "provider": provider,
-                "session_id": session_id,
-                "transcript_path": str(transcript),
-                "cwd": str(cwd),
-                "agent": agent,
-                "soul_id": soul_id,
-                "vault_root": str(vault),
-                "soul_entry": str(soul_entry),
-                "identity_source": identity_source,
-                # SessionStart carries a source (startup/resume/clear/
-                # compact); a UserPromptSubmit payload has none, so name
-                # the writing event instead of reporting "unknown".
-                "source": _payload_text(payload, "source")
-                or ("prompt" if event_name == "UserPromptSubmit" else "unknown"),
-                "started_at": (
-                    str(existing.get("started_at") or now)
-                    if existing is not None
-                    else now
-                ),
-                "updated_at": now,
-            }
-            encoded = (
-                json.dumps(
-                    record,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                + "\n"
-            ).encode("utf-8")
-            temp = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
-            fd = os.open(str(temp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                view = memoryview(encoded)
-                while view:
-                    written = os.write(fd, view)
-                    if written <= 0:  # pragma: no cover - os.write contract
-                        raise OSError("short terminal session receipt write")
-                    view = view[written:]
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            try:
-                os.replace(temp, target)
-                _fsync_directory(receipts)
-            finally:
-                temp.unlink(missing_ok=True)
-        finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-    return target
 
 
 def verify_integration(repo_root: Path) -> list[str]:
@@ -1220,22 +1010,14 @@ def main() -> int:
     except Exception as exc:
         hook_payload = {}
         print(f"FORREST SESSION PAYLOAD UNAVAILABLE: {exc}")
-    if _payload_text(hook_payload, "hook_event_name", "hookEventName") == (
-        "UserPromptSubmit"
-    ):
-        # First real prompt: pin the receipt and stay silent. Anything printed
-        # here would enter the model's context on every prompt, and a
-        # non-zero exit would erase the user's prompt.
-        try:
-            _record_terminal_session_receipt(
-                hook_payload,
-                agent=str(args.agent),
-            )
-        except Exception as exc:
-            print(
-                f"FORREST TERMINAL CAPTURE RECEIPT UNAVAILABLE: {exc}",
-                file=sys.stderr,
-            )
+    event_name = (
+        _payload_text(hook_payload, "hook_event_name", "hookEventName")
+        or "SessionStart"
+    )
+    if event_name != "SessionStart":
+        # A session opened before bundle 24 still holds the retired prompt
+        # hook in its snapshot. Anything printed here would enter the model's
+        # context on every prompt, and a non-zero exit would erase the prompt.
         return 0
     try:
         _record_managed_session_identity(hook_payload)
@@ -1244,15 +1026,6 @@ def main() -> int:
         # exact conversation resume, so Forrest opens a new model turn instead
         # of guessing `--last`/`--continue`.
         print(f"FORREST MANAGED SESSION ID UNAVAILABLE: {exc}")
-    try:
-        _record_terminal_session_receipt(
-            hook_payload,
-            agent=str(args.agent),
-        )
-    except Exception as exc:
-        # Capture is optional to opening the body, but failure must be visible:
-        # otherwise a CLI session can silently claim cross-surface continuity.
-        print(f"FORREST TERMINAL CAPTURE RECEIPT UNAVAILABLE: {exc}")
     try:
         print(render(str(args.agent), repo_root, body=str(args.body)))
     except Exception as exc:  # SessionStart must remain fail-open.

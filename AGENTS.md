@@ -16,8 +16,8 @@ Council/global source receives a server-minted default-Soul home. Editable
 `source_ref` text is never identity authority. Without a managed WorkUnit, an
 ordinary terminal uses the current runtime-selected/default Soul and does not
 pin, bind, or adopt project identity.
-It pins only that selected Soul in a metadata receipt for bounded idle return
-to the Soul's staging inbox under Forrest's app data; full transcript Adopt stays explicit.
+Nothing records that session or returns it to Forrest memory on its own; full
+transcript Adopt stays explicit.
 
 Confirm startup output contains `<forrest-terminal-context>`. If it did not
 run, execute the shared bootstrap explicitly:

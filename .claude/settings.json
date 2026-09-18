@@ -42,16 +42,6 @@
           }
         ]
       }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/.forrest/session_start.py\" --agent claude-code"
-          }
-        ]
-      }
     ]
   }
 }
