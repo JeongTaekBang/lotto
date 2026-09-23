@@ -3,10 +3,19 @@
 
 Every AI instance that works on BJT's codebases (Claude Code, Codex CLI,
 a human in a terminal) records what it did (`log`), what it learned
-(`learn`), and can leave handoff notes (`note`) and todos (`todo`) for the
-next session. Stateless models forget; the coop is the shared, durable,
+(`learn`), and can leave handoff letters (`note`) and assigned todos (`todo`)
+for the next session. Stateless models forget; the coop is the shared, durable,
 retrievable record that lets them grow across sessions — CWK: models must
 retrieve past learnings when they hit a problem, or there is no growth loop.
+
+Letters are Memory L6's past-self → future-self handoffs (schema v3): a
+dedicated table with a six-state machine — unread → read → working → done,
+plus abandoned / superseded. `note` writes one (optionally `--to` an agent;
+without a recipient it is for any future session of the project). The
+session ritual is `letter read` (the only command that marks letters read),
+`letter start <id>` when acting on one, `letter ack <id> --body …` when it
+shipped. Nothing here polls, claims or notifies: every transition is an
+explicit command in an instance session (Memory L6: 아빠 is the coordinator).
 
 Agents may also address generic mailbox messages to one another.  Coop owns
 delivery, threads, artifact references and claim state; the agents own the
@@ -17,9 +26,10 @@ $HOME/forrest-db/coop.db — deliberately outside the Dropbox CloudStorage
 tree (live SQLite + cloud sync don't mix; CLAUDE.md Dropbox caution).
 Satellite machines reach it over SSH; they do not carry their own copy.
 
-`brief` prints the session-start card: which machine this is, whether it is
-the ground-truth server or a satellite, git sync state (dirty / unpushed /
-no-origin), open notes+todos, and the freshest entries. Wired as a Claude
+`brief` prints the session-start card without changing any state: which
+machine this is, whether it is the ground-truth server or a satellite, git
+sync state (dirty / unpushed / no-origin), the agent's unread and working
+letters, the todos assigned to it, and the freshest entries. Wired as a Claude
 Code SessionStart hook (.claude/settings.json) so every terminal session
 re-grounds automatically; Codex sessions get it via AGENTS.md. The Forrest
 SDK sessions run with setting_sources=[] — the SDK's documented isolation
@@ -52,18 +62,46 @@ import uuid
 
 GROUND_TRUTH_HOST = "Jeongtaeks-Mac-Studio"  # BJT's Mac Studio — the always-on server
 DEFAULT_DB = os.path.join(os.path.expanduser("~"), "forrest-db", "coop.db")
+# The CLI/filter vocabulary. ``note`` stays a word people and docs use, but
+# since schema v3 a note is a row in ``letters``; ``entries`` keeps only the
+# ENTRY_KINDS below plus the frozen pre-v3 note rows (see _migrate_schema).
 KINDS = ("history", "learning", "note", "todo")
+ENTRY_KINDS = ("history", "learning", "todo")
+# Todo statuses (``done``/``status`` commands, /api/coop/entries/{id}/status).
 STATUSES = ("open", "read", "done", "superseded")
+LETTER_STATUSES = (
+    "unread", "read", "working", "done", "abandoned", "superseded",
+)
+ACTIVE_LETTER_STATUSES = ("unread", "read", "working")
+# action -> (statuses it may leave, status it enters). Anything else is an
+# illegal transition and is refused, never coerced.
+LETTER_TRANSITIONS = {
+    "read": (("unread",), "read"),
+    "start": (("read",), "working"),
+    "ack": (("working",), "done"),
+    "abandon": (ACTIVE_LETTER_STATUSES, "abandoned"),
+    "supersede": (ACTIVE_LETTER_STATUSES, "superseded"),
+}
 REVIEW_STATUSES = (
     "open", "claimed", "changes_requested", "approved", "superseded",
 )
 REVIEW_VERDICTS = ("approved", "changes_requested")
 MESSAGE_STATUSES = ("open", "claimed", "done", "superseded")
-COOP_SCHEMA_VERSION = 2
+ACTIVE_MESSAGE_STATUSES = ("open", "claimed")
+COOP_SCHEMA_VERSION = 3
+BRIEF_ITEM_LIMIT = 10
 
 # ---------------------------------------------------------------- storage
 
 FTS_OK = False  # set by connect(); sqlite3.Connection forbids ad-hoc attributes
+
+
+class LetterNotFound(LookupError):
+    """No letter carries the requested id."""
+
+
+class LetterTransitionError(ValueError):
+    """The letter's state or address does not admit the requested move."""
 
 
 @contextmanager
@@ -132,6 +170,7 @@ CREATE TABLE IF NOT EXISTS entries (
   slug TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT '',
   commit_sha TEXT NOT NULL DEFAULT '',
+  assignee TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -188,6 +227,29 @@ CREATE TABLE IF NOT EXISTS review_rounds (
 );
 """
 
+# Created by the v3 migration inside its own transaction (not by the
+# pre-migration _TABLE_SCHEMA script), so the table, the copied notes and the
+# version stamp commit together or not at all.
+_LETTERS_TABLE = """
+CREATE TABLE IF NOT EXISTS letters (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project TEXT NOT NULL,
+  author_agent TEXT NOT NULL,
+  recipient_agent TEXT
+    CHECK (recipient_agent IS NULL OR recipient_agent != ''),
+  machine TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'unread'
+    CHECK (status IN ('unread','read','working','done','abandoned','superseded')),
+  worker_agent TEXT NOT NULL DEFAULT '',
+  ack_body TEXT NOT NULL DEFAULT '',
+  superseded_by INTEGER REFERENCES letters(id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)
+"""
+
 _INDEX_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_entries_kind_created ON entries(kind, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_entries_project ON entries(project);
@@ -203,6 +265,10 @@ CREATE INDEX IF NOT EXISTS idx_reviews_reviewer_status
   ON reviews(reviewer_agent, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_review_rounds_review
   ON review_rounds(review_id, id);
+CREATE INDEX IF NOT EXISTS idx_letters_project_status
+  ON letters(project, status, id);
+CREATE INDEX IF NOT EXISTS idx_letters_recipient_status
+  ON letters(recipient_agent, status, id);
 """
 
 _FTS_SCHEMA = """
@@ -276,6 +342,39 @@ def _migrate_schema(conn):
                     "commit_sha TEXT NOT NULL DEFAULT ''"
                 )
             conn.execute("PRAGMA user_version=2")
+        if current < 3:
+            # Memory L6 (2026-09-23): letters get their own table and state
+            # machine, and todos get an assignee.
+            conn.execute(_LETTERS_TABLE)
+            if "assignee" not in _table_columns(conn, "entries"):
+                conn.execute(
+                    "ALTER TABLE entries ADD COLUMN "
+                    "assignee TEXT NOT NULL DEFAULT ''"
+                )
+            # An existing todo was queued by its author for its author.
+            conn.execute(
+                "UPDATE entries SET assignee=agent"
+                " WHERE kind='todo' AND assignee=''"
+            )
+            # Each note becomes the letter with the SAME id, so "coop #N"
+            # keeps naming it. open had no reader yet (unread); the other
+            # v2 statuses exist in both vocabularies; anything unexpected
+            # surfaces as unread rather than disappearing. The entries row is
+            # kept byte-for-byte as a frozen forensic copy: no v3 reader
+            # shows it or writes it, and a rollback to a v2 client only needs
+            # `PRAGMA user_version=2`. OR IGNORE makes a re-run after such a
+            # rollback keep each letter's live state instead of reverting it.
+            conn.execute(
+                "INSERT OR IGNORE INTO letters (id, project, author_agent,"
+                " recipient_agent, machine, subject, body, status, created_at,"
+                " updated_at)"
+                " SELECT id, project, agent, NULL, machine, title, body,"
+                " CASE status WHEN 'read' THEN 'read' WHEN 'done' THEN 'done'"
+                " WHEN 'superseded' THEN 'superseded' ELSE 'unread' END,"
+                " created_at, updated_at"
+                " FROM entries WHERE kind='note' ORDER BY id"
+            )
+            conn.execute("PRAGMA user_version=3")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -365,7 +464,7 @@ def read_body(value):
 
 
 def add_entry(conn, kind, title, body="", project=None, agent=None,
-              machine=None, slug=None, commit_sha=None):
+              machine=None, slug=None, commit_sha=None, assignee=None):
     """Insert one entry; returns (id, slug).
 
     Memory L6 ordering: a history/learning entry is written BEFORE its git
@@ -373,18 +472,30 @@ def add_entry(conn, kind, title, body="", project=None, agent=None,
     the head is backfilled via ``set_commit_sha``. ``commit_sha`` here is for
     replay-safe machine writers and retroactive records that already know
     their head.
+
+    A todo carries an ``assignee`` (default: its author). A note is not an
+    entry since schema v3 — ``add_letter`` owns it.
     """
-    if kind not in KINDS:
-        raise ValueError("kind must be one of: %s" % ", ".join(KINDS))
+    if kind == "note":
+        raise ValueError(
+            "a note is a letter since coop schema v3 — use add_letter()",
+        )
+    if kind not in ENTRY_KINDS:
+        raise ValueError("kind must be one of: %s" % ", ".join(ENTRY_KINDS))
+    if assignee is not None and kind != "todo":
+        raise ValueError("only a todo has an assignee")
     created = now_iso()
-    status = "open" if kind in ("note", "todo") else ""
+    author = agent or detect_agent()
+    status = "open" if kind == "todo" else ""
+    final_assignee = ((assignee or "").strip() or author) if kind == "todo" else ""
     final_slug = slug or make_slug(title, created)
     cur = conn.execute(
         "INSERT INTO entries (kind, project, agent, machine, title, body, slug, status,"
-        " commit_sha, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (kind, project or detect_project(), agent or detect_agent(),
+        " commit_sha, assignee, created_at, updated_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (kind, project or detect_project(), author,
          machine or detect_machine(), title, body or "", final_slug, status,
-         commit_sha or "", created, created),
+         commit_sha or "", final_assignee, created, created),
     )
     conn.commit()
     return cur.lastrowid, final_slug
@@ -393,8 +504,9 @@ def add_entry(conn, kind, title, body="", project=None, agent=None,
 def set_commit_sha(conn, entry_id, commit_sha):
     """Backfill the git head onto a history/learning entry after the commit.
 
-    Returns True if a row changed. Notes/todos have no commit identity and
-    are refused so a typo'd id cannot silently decorate the wrong kind.
+    Returns True if a row changed. Todos (and the frozen pre-v3 note rows)
+    have no commit identity and are refused so a typo'd id cannot silently
+    decorate the wrong kind.
     """
     sha = (commit_sha or "").strip()
     if not sha:
@@ -409,12 +521,29 @@ def set_commit_sha(conn, entry_id, commit_sha):
 
 
 def set_status(conn, entry_id, new_status):
-    """Set a note/todo status; returns True if a row changed."""
+    """Set a todo status; returns True if a row changed.
+
+    A note became a letter with its own state machine in schema v3
+    (``transition_letter``); its frozen entries row is never rewritten.
+    """
     if new_status not in STATUSES:
         raise ValueError("status must be one of: %s" % ", ".join(STATUSES))
     cur = conn.execute(
-        "UPDATE entries SET status=?, updated_at=? WHERE id=? AND kind IN ('note','todo')",
+        "UPDATE entries SET status=?, updated_at=? WHERE id=? AND kind='todo'",
         (new_status, now_iso(), entry_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def assign_todo(conn, entry_id, assignee):
+    """(Re)assign one todo; returns True if a row changed."""
+    value = (assignee or "").strip()
+    if not value:
+        raise ValueError("assignee must be non-empty")
+    cur = conn.execute(
+        "UPDATE entries SET assignee=?, updated_at=? WHERE id=? AND kind='todo'",
+        (value, now_iso(), entry_id),
     )
     conn.commit()
     return cur.rowcount > 0
@@ -442,18 +571,31 @@ def get_entry_by_slug(conn, project, slug):
     ).fetchone()
 
 
-def _entry_filters(kind=None, project=None, status=None, alias=""):
+def _entry_filters(kind=None, project=None, status=None, assignee=None,
+                   alias=""):
+    """Structured predicates for every live ``entries`` reader.
+
+    The first predicate is unconditional: since schema v3 a note lives in
+    ``letters``, and its original entries row is a frozen forensic copy that
+    must never be presented as current state (its status stopped moving at
+    the migration). ``status`` is one value or a sequence of them.
+    """
     prefix = (alias + ".") if alias else ""
-    where, params = [], []
+    where, params = ["%skind != 'note'" % prefix], []
     for column, value in (("kind", kind), ("project", project),
-                          ("status", status)):
+                          ("assignee", assignee)):
         if value is not None:
             where.append("%s%s=?" % (prefix, column))
             params.append(value)
+    if status is not None:
+        statuses = (status,) if isinstance(status, str) else tuple(status)
+        where.append("%sstatus IN (%s)" % (prefix, ",".join("?" * len(statuses))))
+        params.extend(statuses)
     return where, params
 
 
-def search_rows(conn, query, kind=None, limit=10, *, project=None, status=None):
+def search_rows(conn, query, kind=None, limit=10, *, project=None, status=None,
+                assignee=None):
     """Search with every structured filter applied *before* LIMIT.
 
     The old HTTP route filtered project/status in Python after this function
@@ -463,7 +605,7 @@ def search_rows(conn, query, kind=None, limit=10, *, project=None, status=None):
     preserves one SQL owner.
     """
     filters, filter_params = _entry_filters(
-        kind, project, status, alias="e",
+        kind, project, status, assignee, alias="e",
     )
     structured_sql = (" AND " + " AND ".join(filters)) if filters else ""
     if FTS_OK:
@@ -488,13 +630,14 @@ def search_rows(conn, query, kind=None, limit=10, *, project=None, status=None):
 
 
 def list_entries(conn, *, query=None, kind=None, project=None, status=None,
-                 limit=100):
+                 assignee=None, limit=100):
     """Return newest/ranked entries under one provider-neutral filter API."""
     if query:
         return search_rows(
             conn, query, kind, limit, project=project, status=status,
+            assignee=assignee,
         )
-    where, params = _entry_filters(kind, project, status)
+    where, params = _entry_filters(kind, project, status, assignee)
     sql = "SELECT * FROM entries"
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -503,15 +646,20 @@ def list_entries(conn, *, query=None, kind=None, project=None, status=None,
 
 
 def entry_counts(conn):
-    """Return dashboard counts without exposing SQL to presentation layers."""
-    counts = {kind: 0 for kind in KINDS}
+    """Return dashboard counts without exposing SQL to presentation layers.
+
+    Live entry kinds only: notes are counted by ``letter_counts`` since
+    schema v3, and their frozen entries rows are not current state.
+    """
+    counts = {kind: 0 for kind in ENTRY_KINDS}
     for row in conn.execute(
-        "SELECT kind, COUNT(*) AS n FROM entries GROUP BY kind",
+        "SELECT kind, COUNT(*) AS n FROM entries WHERE kind != 'note'"
+        " GROUP BY kind",
     ):
         counts[row["kind"]] = row["n"]
     counts["total"] = sum(counts.values())
     counts["open"] = conn.execute(
-        "SELECT COUNT(*) FROM entries WHERE status='open'",
+        "SELECT COUNT(*) FROM entries WHERE status='open' AND kind != 'note'",
     ).fetchone()[0]
     return counts
 
@@ -521,10 +669,273 @@ def list_projects(conn):
     return [row[0] for row in conn.execute(
         "SELECT project FROM ("
         " SELECT project FROM entries"
+        " UNION SELECT project FROM letters"
         " UNION SELECT project FROM messages"
         " UNION SELECT project FROM reviews"
         ") ORDER BY project",
     ).fetchall()]
+
+
+# ---------------------------------------------------------------- letters
+# Memory L6 handoffs: past-self → future-self notes with their own six-state
+# machine (LETTER_TRANSITIONS). The table shares one id space with
+# ``entries`` (_next_ledger_id), so a bare "coop #N" names exactly one row.
+# Every move is an explicit command; nothing here polls, claims or notifies.
+
+
+def _next_ledger_id(conn):
+    """Next id in the id space ``letters`` shares with ``entries``.
+
+    Runs inside the caller's write transaction. A pre-v3 note already has an
+    entries id and kept it as its letter id; a new letter takes the next id
+    past every entry and letter ever issued (AUTOINCREMENT sequences
+    included, so a deleted row's number is never reused).
+    """
+    row = conn.execute(
+        "SELECT MAX(n) FROM ("
+        " SELECT MAX(id) AS n FROM entries"
+        " UNION ALL SELECT MAX(id) FROM letters"
+        " UNION ALL SELECT seq FROM sqlite_sequence"
+        " WHERE name IN ('entries','letters'))",
+    ).fetchone()
+    return int(row[0] or 0) + 1
+
+
+def _reserve_entry_id(conn, ledger_id):
+    """Raise the entries AUTOINCREMENT floor past a letter's id.
+
+    Otherwise the next entry — written by this module or by any other writer
+    relying on AUTOINCREMENT — would reuse the letter's number, and a
+    `coop.py done <id>` typed from a letter's receipt could close an
+    unrelated todo. SQLite documents ordinary UPDATE/INSERT on
+    sqlite_sequence; the value only ever grows here.
+    """
+    conn.execute(
+        "UPDATE sqlite_sequence SET seq=? WHERE name='entries' AND seq<?",
+        (ledger_id, ledger_id),
+    )
+    conn.execute(
+        "INSERT INTO sqlite_sequence (name, seq) SELECT 'entries', ?"
+        " WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name='entries')",
+        (ledger_id,),
+    )
+
+
+def add_letter(conn, subject, *, body="", recipient_agent=None,
+               author_agent=None, project=None, machine=None):
+    """Write one unread letter and return its id.
+
+    ``recipient_agent=None`` addresses any future session of ``project``.
+    """
+    text = (subject or "").strip()
+    if not text:
+        raise ValueError("letter subject must not be empty")
+    recipient = (recipient_agent or "").strip() or None
+    author = (author_agent or "").strip() or detect_agent()
+    scope = project or detect_project()
+    host = machine or detect_machine()
+    created = now_iso()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        letter_id = _next_ledger_id(conn)
+        conn.execute(
+            "INSERT INTO letters (id, project, author_agent, recipient_agent,"
+            " machine, subject, body, status, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,'unread',?,?)",
+            (letter_id, scope, author, recipient, host, text, body or "",
+             created, created),
+        )
+        _reserve_entry_id(conn, letter_id)
+        conn.commit()
+        return letter_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_letter(conn, letter_id):
+    """Return one letter row, or None."""
+    return conn.execute(
+        "SELECT * FROM letters WHERE id=?", (letter_id,),
+    ).fetchone()
+
+
+def _check_transition(row, action, agent):
+    """Refuse ``action`` unless ``agent`` may apply it to ``row`` now.
+
+    Addressing mirrors the mailbox: reading, starting and acking belong to
+    the recipient (anyone, for a letter to any session); the author may also
+    withdraw or replace a letter it wrote.
+    """
+    addressed = row["recipient_agent"] is None or row["recipient_agent"] == agent
+    if action in ("abandon", "supersede"):
+        addressed = addressed or row["author_agent"] == agent
+    if not addressed:
+        raise LetterTransitionError(
+            "letter #%d is addressed to %s, not %s" % (
+                row["id"], row["recipient_agent"], agent,
+            )
+        )
+    sources, target = LETTER_TRANSITIONS[action]
+    if row["status"] not in sources:
+        raise LetterTransitionError(
+            "letter #%d is %s; `%s` moves %s → %s" % (
+                row["id"], row["status"], action, "/".join(sources), target,
+            )
+        )
+
+
+def transition_letter(conn, letter_id, action, *, agent, body=None,
+                      superseded_by=None):
+    """Apply one explicit state-machine move; return the updated row.
+
+    ``ack`` requires a non-empty ``body`` (what shipped); ``supersede`` may
+    name the letter that replaces this one. Raises LetterNotFound,
+    LetterTransitionError (illegal state or address) or ValueError (input).
+    """
+    if action not in LETTER_TRANSITIONS:
+        raise ValueError(
+            "letter action must be one of: %s" % ", ".join(LETTER_TRANSITIONS),
+        )
+    actor = (agent or "").strip()
+    if not actor:
+        raise ValueError("a letter transition needs the acting agent")
+    ack_body = None
+    if action == "ack":
+        ack_body = (body or "").strip()
+        if not ack_body:
+            raise ValueError("letter ack requires a non-empty body: say what shipped")
+    elif body is not None:
+        raise ValueError("only ack takes a body")
+    if superseded_by is not None and action != "supersede":
+        raise ValueError("only supersede names a superseding letter")
+    target = LETTER_TRANSITIONS[action][1]
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = get_letter(conn, letter_id)
+        if row is None:
+            raise LetterNotFound("no letter with id %d" % letter_id)
+        _check_transition(row, action, actor)
+        if superseded_by is not None:
+            if superseded_by == letter_id:
+                raise ValueError("a letter cannot supersede itself")
+            if get_letter(conn, superseded_by) is None:
+                raise ValueError("no superseding letter with id %d" % superseded_by)
+        cur = conn.execute(
+            "UPDATE letters SET status=?, worker_agent=?, ack_body=?,"
+            " superseded_by=?, updated_at=? WHERE id=? AND status=?",
+            (
+                target,
+                actor if action == "start" else row["worker_agent"],
+                row["ack_body"] if ack_body is None else ack_body,
+                row["superseded_by"] if superseded_by is None else superseded_by,
+                now_iso(), letter_id, row["status"],
+            ),
+        )
+        if cur.rowcount != 1:  # pragma: no cover - BEGIN IMMEDIATE serializes
+            raise LetterTransitionError("letter #%d changed concurrently" % letter_id)
+        conn.commit()
+        return get_letter(conn, letter_id)
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def read_letters(conn, *, agent, project=None, letter_ids=None):
+    """Mark letters read and return them: the `letter read` ritual.
+
+    With ids, exactly those letters; each must be unread and addressed to
+    ``agent``, and one refusal rolls the whole call back. Without ids, every
+    unread letter addressed to ``agent`` or to any session (in ``project``
+    when given), oldest first. Only an explicit read changes state — `brief`
+    and `letter list` never mark anything read.
+    """
+    actor = (agent or "").strip()
+    if not actor:
+        raise ValueError("reading letters needs the reading agent")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if letter_ids:
+            rows = []
+            for letter_id in dict.fromkeys(letter_ids):
+                row = get_letter(conn, letter_id)
+                if row is None:
+                    raise LetterNotFound("no letter with id %d" % letter_id)
+                _check_transition(row, "read", actor)
+                rows.append(row)
+        else:
+            rows = conn.execute(
+                "SELECT * FROM letters WHERE status='unread'"
+                " AND (recipient_agent=? OR recipient_agent IS NULL)"
+                " AND (? IS NULL OR project=?) ORDER BY id",
+                (actor, project, project),
+            ).fetchall()
+        stamp = now_iso()
+        for row in rows:
+            conn.execute(
+                "UPDATE letters SET status='read', updated_at=?"
+                " WHERE id=? AND status='unread'",
+                (stamp, row["id"]),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return [get_letter(conn, row["id"]) for row in rows]
+
+
+def list_letters(conn, *, query=None, project=None, status=None,
+                 addressed_to=None, worker_agent=None, newest_first=False,
+                 limit=100):
+    """Return letters, active ones first, then newest (or newest only).
+
+    ``addressed_to`` keeps letters whose recipient is that agent or any
+    session; ``status`` is one value or a sequence. Every predicate applies
+    before LIMIT, so an old unread letter cannot hide behind newer settled
+    ones. Each query term must appear in the subject, body or ack body.
+    """
+    where, params = [], []
+    if project is not None:
+        where.append("project=?")
+        params.append(project)
+    if status is not None:
+        statuses = (status,) if isinstance(status, str) else tuple(status)
+        where.append("status IN (%s)" % ",".join("?" * len(statuses)))
+        params.extend(statuses)
+    if addressed_to is not None:
+        where.append("(recipient_agent=? OR recipient_agent IS NULL)")
+        params.append(addressed_to)
+    if worker_agent is not None:
+        where.append("worker_agent=?")
+        params.append(worker_agent)
+    for term in (query or "").split():
+        like = "%" + term + "%"
+        where.append("(subject LIKE ? OR body LIKE ? OR ack_body LIKE ?)")
+        params.extend((like, like, like))
+    sql = "SELECT * FROM letters"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += (
+        " ORDER BY id DESC LIMIT ?" if newest_first
+        else " ORDER BY status IN ('unread','read','working') DESC, id DESC LIMIT ?"
+    )
+    return conn.execute(sql, [*params, limit]).fetchall()
+
+
+def letter_counts(conn, *, project=None, addressed_to=None):
+    """Per-status letter counts plus ``total`` and ``active``."""
+    counts = {status: 0 for status in LETTER_STATUSES}
+    for row in conn.execute(
+        "SELECT status, COUNT(*) AS n FROM letters"
+        " WHERE (? IS NULL OR project=?)"
+        " AND (? IS NULL OR recipient_agent=? OR recipient_agent IS NULL)"
+        " GROUP BY status",
+        (project, project, addressed_to, addressed_to),
+    ):
+        counts[row["status"]] = row["n"]
+    counts["total"] = sum(counts[status] for status in LETTER_STATUSES)
+    counts["active"] = sum(counts[status] for status in ACTIVE_LETTER_STATUSES)
+    return counts
 
 
 # ---------------------------------------------------------------- mailbox
@@ -674,15 +1085,21 @@ def message_artifact_refs(row):
 def list_messages(conn, *, query=None, project=None, status=None,
                   recipient_agent=None, sender_agent=None, thread_id=None,
                   limit=100):
+    """``status`` is one value or a sequence of them; like every other
+    predicate it applies before the LIMIT."""
     where, params = [], []
     for column, value in (
-        ("project", project), ("status", status),
+        ("project", project),
         ("recipient_agent", recipient_agent), ("sender_agent", sender_agent),
         ("thread_id", thread_id),
     ):
         if value is not None:
             where.append("%s=?" % column)
             params.append(value)
+    if status is not None:
+        statuses = (status,) if isinstance(status, str) else tuple(status)
+        where.append("status IN (%s)" % ",".join("?" * len(statuses)))
+        params.extend(statuses)
     if query:
         where.append(
             "(subject LIKE ? OR body LIKE ? OR intent LIKE ? OR artifact_refs LIKE ?)",
@@ -1194,15 +1611,69 @@ def resubmit_review(conn, review_id, requester_agent, head_sha, body=None):
 
 def cmd_add(args, kind):
     conn = connect()
-    entry_id, slug = add_entry(
-        conn, kind, args.title, body=read_body(args.body),
-        project=args.project, agent=args.agent, slug=args.slug,
-        commit_sha=getattr(args, "sha", None),
-    )
-    print("coop #%d %s recorded — %s" % (entry_id, kind, slug))
+    try:
+        entry_id, slug = add_entry(
+            conn, kind, args.title, body=read_body(args.body),
+            project=args.project, agent=args.agent, slug=args.slug,
+            commit_sha=getattr(args, "sha", None),
+            assignee=getattr(args, "assignee", None),
+        )
+        row = get_entry(conn, entry_id)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    finally:
+        conn.close()
+    suffix = (" (assigned to %s)" % row["assignee"]) if kind == "todo" else ""
+    print("coop #%d %s recorded — %s%s" % (entry_id, kind, slug, suffix))
     if kind in ("history", "learning") and not getattr(args, "sha", None):
         print("(entry-first flow: after the commit lands, backfill with "
               "`coop.py sha %d <head>`)" % entry_id)
+
+
+def cmd_note(args):
+    """`note` keeps its name and habit; since schema v3 it writes a letter."""
+    conn = connect()
+    try:
+        letter_id = add_letter(
+            conn, args.title, body=read_body(args.body),
+            recipient_agent=args.to, author_agent=args.agent,
+            project=args.project,
+        )
+        row = get_letter(conn, letter_id)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    finally:
+        conn.close()
+    print("coop letter #%d recorded → %s" % (
+        letter_id, row["recipient_agent"] or "any future session of %s" % row["project"],
+    ))
+    print("(read with `coop.py letter read`; then `letter start %d`, and "
+          "`letter ack %d --body …` when it ships)" % (letter_id, letter_id))
+
+
+def _not_a_todo(conn, entry_id):
+    """Explain a todo command that matched nothing — often a letter id."""
+    letter = get_letter(conn, entry_id)
+    if letter is not None:
+        return (
+            "coop #%d is a letter (%s), not a todo — letters move with "
+            "`coop.py letter read|start|ack|abandon|supersede %d`"
+            % (entry_id, letter["status"], entry_id)
+        )
+    return "no todo with id %d" % entry_id
+
+
+def cmd_assign(args):
+    conn = connect()
+    try:
+        changed = assign_todo(conn, args.id, args.assignee)
+        if not changed:
+            sys.exit(_not_a_todo(conn, args.id))
+    except ValueError as exc:
+        sys.exit(str(exc))
+    finally:
+        conn.close()
+    print("coop todo #%d assigned to %s" % (args.id, args.assignee.strip()))
 
 
 def cmd_sha(args):
@@ -1221,61 +1692,173 @@ def cmd_status(args):
     conn = connect()
     try:
         changed = set_status(conn, args.id, new_status)
+        if not changed:
+            sys.exit(_not_a_todo(conn, args.id))
     except ValueError as exc:
         sys.exit(str(exc))
-    if not changed:
-        sys.exit("no note/todo with id %d" % args.id)
+    finally:
+        conn.close()
     print("coop #%d -> %s" % (args.id, new_status))
 
 
 def format_row(r):
     flag = (" [%s]" % r["status"]) if r["status"] not in ("", "done") else ""
+    who = r["agent"]
+    if r["kind"] == "todo" and r["assignee"]:
+        who = "%s -> %s" % (r["agent"], r["assignee"])
     return "#%-4d %-8s %s  %s · %s · %s%s" % (
         r["id"], r["kind"], r["created_at"][:16].replace("T", " "),
-        r["title"], r["project"], r["agent"], flag,
+        r["title"], r["project"], who, flag,
     )
+
+
+def format_letter(row):
+    worker = (
+        " by %s" % row["worker_agent"]
+        if row["status"] == "working" and row["worker_agent"] else ""
+    )
+    return "#%-4d %-8s %s  %s · %s · %s -> %s [%s%s]" % (
+        row["id"], "letter", row["created_at"][:16].replace("T", " "),
+        row["subject"], row["project"], row["author_agent"],
+        row["recipient_agent"] or "any session", row["status"], worker,
+    )
+
+
+def print_letter(row):
+    print(format_letter(row))
+    print("machine: %s · updated: %s" % (row["machine"], row["updated_at"]))
+    if row["body"]:
+        print("\n" + row["body"])
+    if row["ack_body"]:
+        print("\nack: " + row["ack_body"])
+    if row["superseded_by"]:
+        print("\nsuperseded by letter #%d" % row["superseded_by"])
 
 
 def cmd_recent(args):
+    """Newest entries and letters, interleaved by their shared ledger id."""
     conn = connect()
-    rows = list_entries(
-        conn,
-        kind=args.kind,
-        project=None if args.all_projects else detect_project(args.project),
-        limit=args.n,
-    )
-    if not rows:
+    project = None if args.all_projects else detect_project(args.project)
+    lines = []
+    if args.kind != "note":
+        lines.extend(
+            (r["id"], format_row(r))
+            for r in list_entries(conn, kind=args.kind, project=project, limit=args.n)
+        )
+    if args.kind in (None, "note"):
+        lines.extend(
+            (row["id"], format_letter(row))
+            for row in list_letters(
+                conn, project=project, newest_first=True, limit=args.n,
+            )
+        )
+    conn.close()
+    lines.sort(key=lambda item: item[0], reverse=True)
+    if not lines:
         print("coop: no entries yet")
-    for r in rows:
-        print(format_row(r))
+    for _id, line in lines[:args.n]:
+        print(line)
 
 
 def cmd_search(args):
     conn = connect()
-    rows = list_entries(
-        conn,
-        query=args.query,
-        kind=args.kind,
-        project=None if args.all_projects else detect_project(args.project),
-        limit=args.n,
+    project = None if args.all_projects else detect_project(args.project)
+    rows = [] if args.kind == "note" else list_entries(
+        conn, query=args.query, kind=args.kind, project=project, limit=args.n,
     )
-    if not rows:
+    letters = list_letters(
+        conn, query=args.query, project=project, limit=args.n,
+    ) if args.kind in (None, "note") else []
+    conn.close()
+    if not rows and not letters:
         print("coop: no match for %r" % args.query)
     for r in rows:
         print(format_row(r))
+    for row in letters:
+        print(format_letter(row))
 
 
 def cmd_show(args):
     conn = connect()
     r = get_entry(conn, args.id)
-    if not r:
-        sys.exit("no entry with id %d" % args.id)
+    letter = get_letter(conn, args.id)
+    conn.close()
+    if r is None and letter is None:
+        sys.exit("no entry or letter with id %d" % args.id)
+    if letter is not None:
+        print_letter(letter)
+        if r is not None and r["kind"] == "note":
+            print("\n(migrated from note entry #%d at coop schema v3; that entries "
+                  "row is a frozen copy, left at status '%s')" % (r["id"], r["status"]))
+            return
+    if r is None:
+        return
     print(format_row(r))
     print("slug: %s · machine: %s · updated: %s" % (r["slug"], r["machine"], r["updated_at"]))
     if r["commit_sha"]:
         print("commit: %s" % r["commit_sha"])
     if r["body"]:
         print("\n" + r["body"])
+
+
+def cmd_letter_read(args):
+    agent = detect_agent(args.agent)
+    conn = connect()
+    try:
+        rows = read_letters(
+            conn,
+            agent=agent,
+            project=None if args.all_projects else detect_project(args.project),
+            letter_ids=args.ids,
+        )
+    except (LetterNotFound, ValueError) as exc:
+        sys.exit(str(exc))
+    finally:
+        conn.close()
+    if not rows:
+        print("coop: no unread letters for %s" % agent)
+        return
+    for row in rows:
+        print(format_letter(row))
+        for line in (row["body"] or "(no body)").splitlines():
+            print("    " + line)
+    print("(now read; `coop.py letter start <id>` when you act on one, "
+          "`coop.py letter ack <id> --body …` when it ships)")
+
+
+def cmd_letter_move(args):
+    agent = detect_agent(args.agent)
+    conn = connect()
+    try:
+        row = transition_letter(
+            conn, args.id, args.letter_cmd, agent=agent,
+            body=read_body(args.body) if args.letter_cmd == "ack" else None,
+            superseded_by=getattr(args, "by", None),
+        )
+    except (LetterNotFound, ValueError) as exc:
+        sys.exit(str(exc))
+    finally:
+        conn.close()
+    print("coop letter #%d -> %s" % (row["id"], row["status"]))
+
+
+def cmd_letter_list(args):
+    agent = detect_agent(args.agent)
+    conn = connect()
+    try:
+        rows = list_letters(
+            conn,
+            project=None if args.all_projects else detect_project(args.project),
+            status=None if args.all else ACTIVE_LETTER_STATUSES,
+            addressed_to=agent,
+            limit=args.n,
+        )
+    finally:
+        conn.close()
+    if not rows:
+        print("coop: no letters for %s" % agent)
+    for row in rows:
+        print(format_letter(row))
 
 
 def format_message(row):
@@ -1317,13 +1900,12 @@ def cmd_inbox(args):
         rows = list_messages(
             conn,
             project=None if args.all_projects else detect_project(args.project),
+            status=None if args.all else ACTIVE_MESSAGE_STATUSES,
             recipient_agent=agent,
             limit=args.n,
         )
     finally:
         conn.close()
-    if not args.all:
-        rows = [row for row in rows if row["status"] in ("open", "claimed")]
     if not rows:
         print("coop: inbox empty for %s" % agent)
     for row in rows:
@@ -1492,6 +2074,37 @@ def git_line(cwd):
         os.path.basename(top), branch, state, sync), warns
 
 
+def _print_brief_letters(conn, project, agent):
+    """Unread letters addressed to ``agent`` (or any session) and the ones it
+    is working on. A letter read but never started is counted, not listed,
+    so it cannot silently drop out of every session card."""
+    unread = list_letters(
+        conn, project=project, status="unread", addressed_to=agent,
+        limit=BRIEF_ITEM_LIMIT + 1,
+    )
+    working = list_letters(
+        conn, project=project, status="working", worker_agent=agent,
+        limit=BRIEF_ITEM_LIMIT + 1,
+    )
+    parked = letter_counts(conn, project=project, addressed_to=agent)["read"]
+    if not (unread or working or parked):
+        return
+
+    def count(rows):  # rows is a LIMIT + 1 probe
+        return "%d+" % BRIEF_ITEM_LIMIT if len(rows) > BRIEF_ITEM_LIMIT else str(len(rows))
+
+    hint = " — `coop.py letter read` prints and marks them read" if unread else ""
+    print("Letters : (%s in %s) %s unread · %s working%s" % (
+        agent, project, count(unread), count(working), hint,
+    ))
+    for row in unread[:BRIEF_ITEM_LIMIT] + working[:BRIEF_ITEM_LIMIT]:
+        print("  " + format_letter(row))
+    if len(unread) > BRIEF_ITEM_LIMIT or len(working) > BRIEF_ITEM_LIMIT:
+        print("  … more — `coop.py letter list`")
+    if parked:
+        print("  (%d read but not started — `coop.py letter list`)" % parked)
+
+
 def cmd_brief(args):
     try:
         machine = detect_machine()
@@ -1510,22 +2123,28 @@ def cmd_brief(args):
         conn = connect()
         project = detect_project(args.project)
         agent = detect_agent(args.agent)
-        open_rows = list_entries(conn, status="open", limit=5)
-        if open_rows:
-            print("Open    :")
-            for r in open_rows:
+        # Read-only by contract: only an explicit `letter read` marks a
+        # letter read, so the card lists what is waiting without moving it.
+        _print_brief_letters(conn, project, agent)
+        todos = list_entries(
+            conn, kind="todo", status=("open", "read"), project=project,
+            assignee=agent, limit=BRIEF_ITEM_LIMIT + 1,
+        )
+        if todos:
+            print("Todos   : (assigned to %s in %s)" % (agent, project))
+            for r in todos[:BRIEF_ITEM_LIMIT]:
                 print("  " + format_row(r))
+            if len(todos) > BRIEF_ITEM_LIMIT:
+                print("  … more — `coop.py recent --kind todo -n 50`")
         recent = list_entries(conn, project=project, limit=args.n)
         if recent:
             print("Recent  : (project %s)" % project)
             for r in recent:
                 print("  " + format_row(r))
-        inbox = [
-            row for row in list_messages(
-                conn, project=project, recipient_agent=agent, limit=20,
-            )
-            if row["status"] in ("open", "claimed")
-        ][:5]
+        inbox = list_messages(
+            conn, project=project, status=ACTIVE_MESSAGE_STATUSES,
+            recipient_agent=agent, limit=5,
+        )
         if inbox:
             print("Inbox   : (agent %s)" % agent)
             for row in inbox:
@@ -1534,6 +2153,8 @@ def cmd_brief(args):
         print("Rules   : per work unit → `coop.py log` BEFORE the commit,"
               " then commit+push, then `coop.py sha <id> <head>`;"
               " non-obvious lesson → `coop.py learn`;"
+              " handoff → `coop.py note` (a letter: `letter read` →"
+              " `letter start <id>` → `letter ack <id> --body …`);"
               " optional collaboration → `coop.py send/inbox/reply`;"
               " before deep debugging → `coop.py search <kw>`.")
         print("━━━━━━━━")
@@ -1575,10 +2196,56 @@ def main(argv=None):
         if name in ("log", "learn"):
             s.add_argument("--sha", help="git head when already known "
                            "(machine writers / retroactive records)")
+        if name == "todo":
+            s.add_argument("--assignee", help="who should do it (default: you)")
         return s
 
-    for name in ("log", "learn", "note", "todo"):
+    for name in ("log", "learn", "todo"):
         add_writer(name)
+
+    s = sub.add_parser("note", help="write a handoff letter (schema v3)")
+    s.add_argument("title", help="letter subject")
+    s.add_argument("-b", "--body", default="", help="letter body; '-' reads stdin")
+    s.add_argument("--to", help="recipient agent; omit for any future "
+                   "session of the project")
+    s.add_argument("--project")
+    s.add_argument("--agent")
+
+    s = sub.add_parser("assign", help="(re)assign a todo")
+    s.add_argument("id", type=int)
+    s.add_argument("assignee")
+
+    s = sub.add_parser("letter", help="Memory L6 handoff letters")
+    letter_sub = s.add_subparsers(dest="letter_cmd", required=True)
+    s = letter_sub.add_parser(
+        "read", help="print unread letters addressed to you (or the given "
+        "ids) and mark them read — the only command that does",
+    )
+    s.add_argument("ids", type=int, nargs="*")
+    s.add_argument("--project")
+    s.add_argument("--all-projects", action="store_true")
+    s.add_argument("--agent")
+    for name, help_text in (
+        ("start", "read → working: you are acting on it"),
+        ("ack", "working → done: it shipped (body required)"),
+        ("abandon", "unread/read/working → abandoned"),
+        ("supersede", "unread/read/working → superseded"),
+    ):
+        s = letter_sub.add_parser(name, help=help_text)
+        s.add_argument("id", type=int)
+        s.add_argument("--agent")
+        if name == "ack":
+            s.add_argument("-b", "--body", required=True,
+                           help="what shipped; '-' reads stdin")
+        if name == "supersede":
+            s.add_argument("--by", type=int, help="the letter that replaces it")
+    s = letter_sub.add_parser("list", help="letters addressed to you (read-only)")
+    s.add_argument("-n", type=int, default=20)
+    s.add_argument("--all", action="store_true",
+                   help="include done/abandoned/superseded")
+    s.add_argument("--all-projects", action="store_true")
+    s.add_argument("--project")
+    s.add_argument("--agent")
 
     s = sub.add_parser("sha")
     s.add_argument("id", type=int)
@@ -1657,9 +2324,20 @@ def main(argv=None):
     s.add_argument("--agent")
 
     args = p.parse_args(argv)
-    kind_map = {"log": "history", "learn": "learning", "note": "note", "todo": "todo"}
+    kind_map = {"log": "history", "learn": "learning", "todo": "todo"}
     if args.cmd in kind_map:
         cmd_add(args, kind_map[args.cmd])
+    elif args.cmd == "note":
+        cmd_note(args)
+    elif args.cmd == "assign":
+        cmd_assign(args)
+    elif args.cmd == "letter":
+        if args.letter_cmd == "read":
+            cmd_letter_read(args)
+        elif args.letter_cmd == "list":
+            cmd_letter_list(args)
+        else:
+            cmd_letter_move(args)
     elif args.cmd == "sha":
         cmd_sha(args)
     elif args.cmd in ("done", "status"):

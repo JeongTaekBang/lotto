@@ -28,6 +28,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -699,6 +700,30 @@ def _identity_sections(
     return sections, warnings
 
 
+def _prompt_mode(text: str) -> str | None:
+    """Stdlib-only copy of the shared scalar contract in utils/prompt_notes.
+
+    This file is vendored into repositories that cannot import the backend.
+    Cross-host tests keep the note-authoring contract identical.
+    """
+    lines = text.strip().removeprefix("\ufeff").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration:
+        return "on-demand"
+    values = [line.partition(":")[2].split("#", 1)[0].strip()
+              for line in lines[1:end] if line.startswith("prompt:")]
+    if not values:
+        return None
+    if len(values) != 1:
+        return "on-demand"
+    if re.fullmatch(r'''(?:inline|'inline'|"inline")''', values[0]):
+        return "inline"
+    return "on-demand"
+
+
 def _core_candidates(
     root: Path, *, kind: str = "active soul",
 ) -> tuple[list[tuple[str, str, str, str | None]], list[str]]:
@@ -724,10 +749,13 @@ def _core_candidates(
             continue
         rel = path.relative_to(root.resolve()).as_posix()
         label = f"shared {rel}" if kind == "shared soul" else rel
+        body = _read(path, owner_root=root)
+        if kind == "shared soul" and body and _prompt_mode(body) != "inline":
+            body = f"On-demand note. Read `{path}` when needed."
         candidates.append((
             label,
             str(path),
-            _read(path, owner_root=root),
+            body,
             f"CRITICAL: {kind} core note is unavailable or outside its vault: {path}",
         ))
     return candidates, warnings
