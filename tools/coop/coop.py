@@ -351,11 +351,8 @@ def _migrate_schema(conn):
                     "ALTER TABLE entries ADD COLUMN "
                     "assignee TEXT NOT NULL DEFAULT ''"
                 )
-            # An existing todo was queued by its author for its author.
-            conn.execute(
-                "UPDATE entries SET assignee=agent"
-                " WHERE kind='todo' AND assignee=''"
-            )
+            # An existing todo had no assignee: it stays anyone's (every
+            # brief lists it), as every open todo was listed under v2.
             # Each note becomes the letter with the SAME id, so "coop #N"
             # keeps naming it. open had no reader yet (unread); the other
             # v2 statuses exist in both vocabularies; anything unexpected
@@ -428,8 +425,26 @@ def detect_agent(cli_value=None):
 
 
 def detect_project(cli_value=None, cwd=None):
+    """The project a checkout belongs to: its repository's name.
+
+    A linked worktree (`.claude/worktrees/<x>`, a WorkUnit workspace) shares
+    its repository's common git dir, so every checkout of one repository names
+    the same project; its own folder name would scope briefs and letters to a
+    project nobody else reads.
+    """
     if cli_value:
         return cli_value
+    try:
+        common = subprocess.run(
+            ["git", "-C", cwd or os.getcwd(), "rev-parse",
+             "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, timeout=10,
+        )
+        git_dir = common.stdout.strip() if common.returncode == 0 else ""
+        if git_dir and os.path.basename(git_dir) == ".git":
+            return os.path.basename(os.path.dirname(git_dir))
+    except Exception:
+        pass
     try:
         top = subprocess.run(
             ["git", "-C", cwd or os.getcwd(), "rev-parse", "--show-toplevel"],
@@ -473,8 +488,9 @@ def add_entry(conn, kind, title, body="", project=None, agent=None,
     replay-safe machine writers and retroactive records that already know
     their head.
 
-    A todo carries an ``assignee`` (default: its author). A note is not an
-    entry since schema v3 — ``add_letter`` owns it.
+    A todo carries an optional ``assignee``; an unassigned todo is anyone's
+    (every brief lists it). A note is not an entry since schema v3 —
+    ``add_letter`` owns it.
     """
     if kind == "note":
         raise ValueError(
@@ -487,7 +503,7 @@ def add_entry(conn, kind, title, body="", project=None, agent=None,
     created = now_iso()
     author = agent or detect_agent()
     status = "open" if kind == "todo" else ""
-    final_assignee = ((assignee or "").strip() or author) if kind == "todo" else ""
+    final_assignee = (assignee or "").strip() if kind == "todo" else ""
     final_slug = slug or make_slug(title, created)
     cur = conn.execute(
         "INSERT INTO entries (kind, project, agent, machine, title, body, slug, status,"
@@ -537,10 +553,10 @@ def set_status(conn, entry_id, new_status):
 
 
 def assign_todo(conn, entry_id, assignee):
-    """(Re)assign one todo; returns True if a row changed."""
-    value = (assignee or "").strip()
-    if not value:
-        raise ValueError("assignee must be non-empty")
+    """(Re)assign one todo, or unassign it with None; True if a row changed."""
+    value = "" if assignee is None else assignee.strip()
+    if assignee is not None and not value:
+        raise ValueError("assignee must be non-empty (None unassigns)")
     cur = conn.execute(
         "UPDATE entries SET assignee=?, updated_at=? WHERE id=? AND kind='todo'",
         (value, now_iso(), entry_id),
@@ -582,11 +598,14 @@ def _entry_filters(kind=None, project=None, status=None, assignee=None,
     """
     prefix = (alias + ".") if alias else ""
     where, params = ["%skind != 'note'" % prefix], []
-    for column, value in (("kind", kind), ("project", project),
-                          ("assignee", assignee)):
+    for column, value in (("kind", kind), ("project", project)):
         if value is not None:
             where.append("%s%s=?" % (prefix, column))
             params.append(value)
+    if assignee is not None:
+        assignees = (assignee,) if isinstance(assignee, str) else tuple(assignee)
+        where.append("%sassignee IN (%s)" % (prefix, ",".join("?" * len(assignees))))
+        params.extend(assignees)
     if status is not None:
         statuses = (status,) if isinstance(status, str) else tuple(status)
         where.append("%sstatus IN (%s)" % (prefix, ",".join("?" * len(statuses))))
@@ -765,8 +784,17 @@ def _check_transition(row, action, agent):
 
     Addressing mirrors the mailbox: reading, starting and acking belong to
     the recipient (anyone, for a letter to any session); the author may also
-    withdraw or replace a letter it wrote.
+    withdraw or replace a letter it wrote. Like a claimed message, a working
+    letter belongs to the agent that started it: only that worker may ack it,
+    and only the worker or the author may abandon or replace it.
     """
+    if row["status"] == "working" and agent != row["worker_agent"]:
+        if action == "ack" or row["author_agent"] != agent:
+            raise LetterTransitionError(
+                "letter #%d is being worked on by %s, not %s" % (
+                    row["id"], row["worker_agent"], agent,
+                )
+            )
     addressed = row["recipient_agent"] is None or row["recipient_agent"] == agent
     if action in ("abandon", "supersede"):
         addressed = addressed or row["author_agent"] == agent
@@ -819,8 +847,16 @@ def transition_letter(conn, letter_id, action, *, agent, body=None,
         if superseded_by is not None:
             if superseded_by == letter_id:
                 raise ValueError("a letter cannot supersede itself")
-            if get_letter(conn, superseded_by) is None:
+            replacement = get_letter(conn, superseded_by)
+            if replacement is None:
                 raise ValueError("no superseding letter with id %d" % superseded_by)
+            if replacement["status"] not in ACTIVE_LETTER_STATUSES:
+                # A replacement that is itself closed or replaced would leave
+                # the handoff with nowhere to go (and allow A→B→A cycles).
+                raise ValueError(
+                    "letter #%d is %s and cannot replace another"
+                    % (superseded_by, replacement["status"]),
+                )
         cur = conn.execute(
             "UPDATE letters SET status=?, worker_agent=?, ack_body=?,"
             " superseded_by=?, updated_at=? WHERE id=? AND status=?",
@@ -1664,16 +1700,21 @@ def _not_a_todo(conn, entry_id):
 
 
 def cmd_assign(args):
+    if args.unassign == bool(args.assignee):
+        sys.exit("give an assignee, or --unassign")
     conn = connect()
     try:
-        changed = assign_todo(conn, args.id, args.assignee)
+        changed = assign_todo(conn, args.id, None if args.unassign else args.assignee)
         if not changed:
             sys.exit(_not_a_todo(conn, args.id))
     except ValueError as exc:
         sys.exit(str(exc))
     finally:
         conn.close()
-    print("coop todo #%d assigned to %s" % (args.id, args.assignee.strip()))
+    if args.unassign:
+        print("coop todo #%d is unassigned (anyone's)" % args.id)
+    else:
+        print("coop todo #%d assigned to %s" % (args.id, args.assignee.strip()))
 
 
 def cmd_sha(args):
@@ -2128,10 +2169,10 @@ def cmd_brief(args):
         _print_brief_letters(conn, project, agent)
         todos = list_entries(
             conn, kind="todo", status=("open", "read"), project=project,
-            assignee=agent, limit=BRIEF_ITEM_LIMIT + 1,
+            assignee=(agent, ""), limit=BRIEF_ITEM_LIMIT + 1,
         )
         if todos:
-            print("Todos   : (assigned to %s in %s)" % (agent, project))
+            print("Todos   : (%s's and unassigned, in %s)" % (agent, project))
             for r in todos[:BRIEF_ITEM_LIMIT]:
                 print("  " + format_row(r))
             if len(todos) > BRIEF_ITEM_LIMIT:
@@ -2211,9 +2252,10 @@ def main(argv=None):
     s.add_argument("--project")
     s.add_argument("--agent")
 
-    s = sub.add_parser("assign", help="(re)assign a todo")
+    s = sub.add_parser("assign", help="(re)assign a todo, or --unassign it")
     s.add_argument("id", type=int)
-    s.add_argument("assignee")
+    s.add_argument("assignee", nargs="?")
+    s.add_argument("--unassign", action="store_true")
 
     s = sub.add_parser("letter", help="Memory L6 handoff letters")
     letter_sub = s.add_subparsers(dest="letter_cmd", required=True)
