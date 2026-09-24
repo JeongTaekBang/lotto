@@ -420,13 +420,17 @@ def _shared_instructions(
         fresh = _read(Path(value), owner_root=shared_root)
     if fresh:
         return fresh
+    fallback = (
+        "using the copy the backend published."
+        if copied else "the backend published no copy."
+    )
+    reason = (
+        f"{value} could not be read inside {shared_root}"
+        if shared_root is not None
+        else f"no shared root was published to read {value} inside"
+    )
     warnings.append(
-        f"ACTIVE SHARED SOUL INSTRUCTIONS UNAVAILABLE: {value} could not be "
-        f"read inside {shared_root}; "
-        + (
-            "using the copy the backend published."
-            if copied else "the backend published no copy."
-        )
+        f"ACTIVE SHARED SOUL INSTRUCTIONS UNAVAILABLE: {reason}; {fallback}"
     )
     return copied
 

@@ -310,28 +310,38 @@ CREATE INDEX IF NOT EXISTS idx_learning_entries_project
   ON learning_entries(project, id);
 """
 
-_FTS_SCHEMA = """
+# The two external-content FTS5 indexes, each a (table name, statements) pair
+# that _ensure_fts_index runs one statement at a time, in one transaction with
+# the rebuild. entries_fts indexes free-body entries (title, body); the typed
+# learnings' index covers LEARNING_TEXT_FIELDS.
+_FTS_SCHEMA = (
+    """
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts
-  USING fts5(title, body, content='entries', content_rowid='id');
+  USING fts5(title, body, content='entries', content_rowid='id')
+""",
+    """
 CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
   INSERT INTO entries_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
-END;
+END
+""",
+    """
 CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
   INSERT INTO entries_fts(entries_fts, rowid, title, body)
     VALUES ('delete', old.id, old.title, old.body);
-END;
+END
+""",
+    """
 CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
   INSERT INTO entries_fts(entries_fts, rowid, title, body)
     VALUES ('delete', old.id, old.title, old.body);
   INSERT INTO entries_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
-END;
-"""
+END
+""",
+)
 
-# The typed learnings' index over LEARNING_TEXT_FIELDS. _ensure_learning_index
-# runs these one statement at a time, in one transaction with the rebuild.
 _LEARNING_FTS_SCHEMA = (
     """
-CREATE VIRTUAL TABLE learning_entries_fts
+CREATE VIRTUAL TABLE IF NOT EXISTS learning_entries_fts
   USING fts5(scope, slug, problem, hypothesis, resolution, source,
              content='learning_entries', content_rowid='id')
 """,
@@ -456,7 +466,7 @@ def _migrate_schema(conn):
             # rewritten: a pre-v4 learning keeps its entries row and free
             # body, and a v3 client ignores this table, so a rollback is only
             # `PRAGMA user_version=3`. Its FTS index is built after the
-            # migration (_ensure_learning_index), as entries' is, so a SQLite
+            # migration (_ensure_fts_index), as entries' is, so a SQLite
             # without FTS5 still migrates and searches with LIKE.
             conn.execute(_LEARNING_ENTRIES_TABLE)
             conn.execute("PRAGMA user_version=4")
@@ -466,34 +476,27 @@ def _migrate_schema(conn):
         raise
 
 
-def _ensure_learning_index(conn):
-    """Build the learnings FTS index once, complete, or not at all.
+def _ensure_fts_index(conn, table, statements):
+    """Build one external-content FTS index once, complete, or not at all.
 
-    An external-content FTS5 table created beside rows that already exist
-    indexes none of them, and a search that then finds only newer rows hides
-    the older ones (Memory L6 re-audit F2, 2026-09-08, reproduced on
-    ``entries_fts``). So the index, its triggers and a rebuild from
-    ``learning_entries`` commit in one transaction: a cut or a failure leaves
-    no index, and the next connect builds it again. Raises
-    sqlite3.OperationalError without FTS5, which connect() treats as the LIKE
-    fallback.
+    An FTS5 table created beside rows that already exist indexes none of
+    them, and a search that then finds only newer rows hides the older ones
+    (Memory L6 re-audit F2, 2026-09-08, reproduced on ``entries_fts``). So
+    the index, its triggers and a rebuild from its content table commit in
+    one transaction: a cut or a failure leaves no index, and the next connect
+    builds it again. Raises sqlite3.OperationalError without FTS5, which
+    connect() treats as the LIKE fallback.
     """
-    probe = (
-        "SELECT 1 FROM sqlite_master"
-        " WHERE type='table' AND name='learning_entries_fts'"
-    )
-    if conn.execute(probe).fetchone() is not None:
+    probe = "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?"
+    if conn.execute(probe, (table,)).fetchone() is not None:
         return
     conn.execute("BEGIN IMMEDIATE")
     try:
         # Another short-lived CLI may have built it while this one waited.
-        if conn.execute(probe).fetchone() is None:
-            for statement in _LEARNING_FTS_SCHEMA:
+        if conn.execute(probe, (table,)).fetchone() is None:
+            for statement in statements:
                 conn.execute(statement)
-            conn.execute(
-                "INSERT INTO learning_entries_fts(learning_entries_fts)"
-                " VALUES('rebuild')"
-            )
+            conn.execute("INSERT INTO %s(%s) VALUES('rebuild')" % (table, table))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -521,8 +524,8 @@ def connect(path=None):
         conn.close()
         raise
     try:  # FTS5 ships with macOS/homebrew sqlite; degrade to LIKE search without it
-        conn.executescript(_FTS_SCHEMA)
-        _ensure_learning_index(conn)
+        _ensure_fts_index(conn, "entries_fts", _FTS_SCHEMA)
+        _ensure_fts_index(conn, "learning_entries_fts", _LEARNING_FTS_SCHEMA)
         FTS_OK = True
     except sqlite3.OperationalError:
         FTS_OK = False
@@ -749,6 +752,11 @@ def _entry_filters(kind=None, project=None, status=None, assignee=None,
     return where, params
 
 
+def _fts_match(query):
+    """The FTS5 MATCH expression for a free-text query: every term, quoted."""
+    return " ".join('"%s"' % term.replace('"', "") for term in query.split())
+
+
 def search_rows(conn, query, kind=None, limit=10, *, project=None, status=None,
                 assignee=None):
     """Search with every structured filter applied *before* LIMIT.
@@ -764,13 +772,12 @@ def search_rows(conn, query, kind=None, limit=10, *, project=None, status=None,
     )
     structured_sql = (" AND " + " AND ".join(filters)) if filters else ""
     if FTS_OK:
-        fts_query = " ".join('"%s"' % t.replace('"', "") for t in query.split())
         try:
             rows = conn.execute(
                 "SELECT e.* FROM entries_fts f JOIN entries e ON e.id=f.rowid"
                 " WHERE entries_fts MATCH ?" + structured_sql
                 + " ORDER BY rank LIMIT ?",
-                [fts_query, *filter_params, limit],
+                [_fts_match(query), *filter_params, limit],
             ).fetchall()
             if rows:
                 return rows
@@ -1196,9 +1203,8 @@ def list_learnings(conn, *, query=None, project=None, scope=None, limit=100):
             + "".join(" AND " + clause for clause in where)
             + " ORDER BY rank LIMIT ?"
         )
-        match = " ".join('"%s"' % term.replace('"', "") for term in terms)
         try:
-            rows = conn.execute(fts_sql, [match, *params, limit]).fetchall()
+            rows = conn.execute(fts_sql, [_fts_match(query), *params, limit]).fetchall()
             if rows:
                 return rows
         except sqlite3.OperationalError:
