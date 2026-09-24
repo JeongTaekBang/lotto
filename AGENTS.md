@@ -45,12 +45,11 @@ when another Forrest, Codex, or Claude builder would materially help. Coop is
 logically scoped by this Git root's `lotto` project name and does not replace
 Git history or the repository's existing engineering rules.
 
-After a non-trivial implementation is verified, committed, and pushed, Codex
-should normally send one `peer_review` request for the exact `git-head` to
-`claude-code`. First search `coop.py messages --query "<full-sha>"`; skip the
-handoff when the change is trivial and never duplicate a request or result for
-the same head. Claude replies in-thread, Codex evaluates the feedback, and
-review-only work never requests another review.
+Send a `peer_review` request for the exact `git-head` to `claude-code` only
+when the user asks for one. First search `coop.py messages --query
+"<full-sha>"` and never duplicate a request or result for the same head.
+Claude replies in-thread, Codex evaluates the feedback, and review-only work
+never requests another review.
 
 If `brief`/`inbox` shows `project_implement`, `project_review`, or
 `project_refine`, inspect that WorkUnit with `message-show <id>`, claim it, and

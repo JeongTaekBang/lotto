@@ -391,6 +391,46 @@ def _shared_root(value: object, warnings: list[str]) -> Path | None:
         return None
 
 
+def _shared_instructions(
+    value: object,
+    shared_root: Path | None,
+    copied: str,
+    warnings: list[str],
+) -> str:
+    """Read the registry-wide template fresh; the published copy is a fallback.
+
+    Memory L5: the terminal host reads its bootstrap when it starts, so an
+    edit to the shared file reaches the next session without a backend
+    republish. The read passes the same owner check as the Soul vault.
+    """
+    if value is None:
+        # Additive descriptor field: an older backend published only the copy.
+        if not copied:
+            warnings.append(
+                "ACTIVE SHARED SOUL INSTRUCTIONS UNAVAILABLE: runtime "
+                "descriptor predates the shared projection."
+            )
+        return copied
+    fresh = ""
+    if (
+        isinstance(value, str)
+        and Path(value).is_absolute()
+        and shared_root is not None
+    ):
+        fresh = _read(Path(value), owner_root=shared_root)
+    if fresh:
+        return fresh
+    warnings.append(
+        f"ACTIVE SHARED SOUL INSTRUCTIONS UNAVAILABLE: {value} could not be "
+        f"read inside {shared_root}; "
+        + (
+            "using the copy the backend published."
+            if copied else "the backend published no copy."
+        )
+    )
+    return copied
+
+
 def _identity_source() -> tuple[
     Path,
     Path | None,
@@ -468,18 +508,19 @@ def _identity_source() -> tuple[
             expected_soul_id=soul_id,
         )
         shared_raw = payload.get("shared_instructions")
-        shared = shared_raw.strip() if isinstance(shared_raw, str) else ""
+        copied = shared_raw.strip() if isinstance(shared_raw, str) else ""
         if profile is None:
             warnings.append(
                 "ACTIVE SOUL ROUTING UNAVAILABLE: runtime descriptor predates "
                 "the canonical routing projection."
             )
-        if not shared:
-            warnings.append(
-                "ACTIVE SHARED SOUL INSTRUCTIONS UNAVAILABLE: runtime "
-                "descriptor predates the shared projection."
-            )
         shared_root = _shared_root(payload.get("shared_vault_root"), warnings)
+        shared = _shared_instructions(
+            payload.get("shared_instructions_path"),
+            shared_root,
+            copied,
+            warnings,
+        )
         return root, soul, profile, shared or None, shared_root, str(descriptor), warnings
     except (
         FileNotFoundError,

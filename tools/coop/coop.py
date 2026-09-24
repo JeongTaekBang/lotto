@@ -17,6 +17,13 @@ session ritual is `letter read` (the only command that marks letters read),
 shipped. Nothing here polls, claims or notifies: every transition is an
 explicit command in an instance session (Memory L6: 아빠 is the coordinator).
 
+Learnings are history's typed sister table (schema v4, Memory L6
+`learning_entries`): history asks what a session did, a learning what a
+framework taught when it blocked the work. `learn <slug>` records one — the
+slug names the symptom, `--scope` the framework or language, and typed fields
+hold the problem, hypothesis, resolution and source. A learning written before
+v4 stays a free-body entries row, readable and searchable as before.
+
 Agents may also address generic mailbox messages to one another.  Coop owns
 delivery, threads, artifact references and claim state; the agents own the
 judgment about whether, when and how to collaborate.
@@ -65,8 +72,16 @@ DEFAULT_DB = os.path.join(os.path.expanduser("~"), "forrest-db", "coop.db")
 # The CLI/filter vocabulary. ``note`` stays a word people and docs use, but
 # since schema v3 a note is a row in ``letters``; ``entries`` keeps only the
 # ENTRY_KINDS below plus the frozen pre-v3 note rows (see _migrate_schema).
+# Since schema v4 a new ``learning`` is a typed row in ``learning_entries``;
+# the entries kind stays readable for the free-body learnings written before
+# it, and no writer adds another (add_entry refuses the kind).
 KINDS = ("history", "learning", "note", "todo")
 ENTRY_KINDS = ("history", "learning", "todo")
+# A typed learning's text columns, in index order: the FTS index and the
+# LIKE fallback both search exactly these.
+LEARNING_TEXT_FIELDS = (
+    "scope", "slug", "problem", "hypothesis", "resolution", "source",
+)
 # Todo statuses (``done``/``status`` commands, /api/coop/entries/{id}/status).
 STATUSES = ("open", "read", "done", "superseded")
 LETTER_STATUSES = (
@@ -88,7 +103,7 @@ REVIEW_STATUSES = (
 REVIEW_VERDICTS = ("approved", "changes_requested")
 MESSAGE_STATUSES = ("open", "claimed", "done", "superseded")
 ACTIVE_MESSAGE_STATUSES = ("open", "claimed")
-COOP_SCHEMA_VERSION = 3
+COOP_SCHEMA_VERSION = 4
 BRIEF_ITEM_LIMIT = 10
 
 # ---------------------------------------------------------------- storage
@@ -250,6 +265,28 @@ CREATE TABLE IF NOT EXISTS letters (
 )
 """
 
+# Created by the v4 migration inside its own transaction, as the letters table
+# is. Memory L6 names the columns: "scope 가 framework 나 언어 …, slug 은
+# 증상-이름, typed 컬럼이 problem / hypothesis / resolution / source 를 들어".
+# The lesson does not say which are required; Forrest requires the slug, the
+# problem and the resolution (add_learning), and these CHECKs hold that for
+# every writer.
+_LEARNING_ENTRIES_TABLE = """
+CREATE TABLE IF NOT EXISTS learning_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project TEXT NOT NULL,
+  author_agent TEXT NOT NULL,
+  scope TEXT NOT NULL DEFAULT '',
+  slug TEXT NOT NULL CHECK (slug != ''),
+  problem TEXT NOT NULL CHECK (problem != ''),
+  hypothesis TEXT NOT NULL DEFAULT '',
+  resolution TEXT NOT NULL CHECK (resolution != ''),
+  source TEXT NOT NULL DEFAULT '',
+  commit_sha TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+)
+"""
+
 _INDEX_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_entries_kind_created ON entries(kind, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_entries_project ON entries(project);
@@ -269,6 +306,8 @@ CREATE INDEX IF NOT EXISTS idx_letters_project_status
   ON letters(project, status, id);
 CREATE INDEX IF NOT EXISTS idx_letters_recipient_status
   ON letters(recipient_agent, status, id);
+CREATE INDEX IF NOT EXISTS idx_learning_entries_project
+  ON learning_entries(project, id);
 """
 
 _FTS_SCHEMA = """
@@ -287,6 +326,44 @@ CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
   INSERT INTO entries_fts(rowid, title, body) VALUES (new.id, new.title, new.body);
 END;
 """
+
+# The typed learnings' index over LEARNING_TEXT_FIELDS. _ensure_learning_index
+# runs these one statement at a time, in one transaction with the rebuild.
+_LEARNING_FTS_SCHEMA = (
+    """
+CREATE VIRTUAL TABLE learning_entries_fts
+  USING fts5(scope, slug, problem, hypothesis, resolution, source,
+             content='learning_entries', content_rowid='id')
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS learning_entries_ai AFTER INSERT ON learning_entries BEGIN
+  INSERT INTO learning_entries_fts(rowid, scope, slug, problem, hypothesis,
+    resolution, source)
+    VALUES (new.id, new.scope, new.slug, new.problem, new.hypothesis,
+    new.resolution, new.source);
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS learning_entries_ad AFTER DELETE ON learning_entries BEGIN
+  INSERT INTO learning_entries_fts(learning_entries_fts, rowid, scope, slug,
+    problem, hypothesis, resolution, source)
+    VALUES ('delete', old.id, old.scope, old.slug, old.problem, old.hypothesis,
+    old.resolution, old.source);
+END
+""",
+    """
+CREATE TRIGGER IF NOT EXISTS learning_entries_au AFTER UPDATE ON learning_entries BEGIN
+  INSERT INTO learning_entries_fts(learning_entries_fts, rowid, scope, slug,
+    problem, hypothesis, resolution, source)
+    VALUES ('delete', old.id, old.scope, old.slug, old.problem, old.hypothesis,
+    old.resolution, old.source);
+  INSERT INTO learning_entries_fts(rowid, scope, slug, problem, hypothesis,
+    resolution, source)
+    VALUES (new.id, new.scope, new.slug, new.problem, new.hypothesis,
+    new.resolution, new.source);
+END
+""",
+)
 
 
 def _table_columns(conn, table):
@@ -372,6 +449,51 @@ def _migrate_schema(conn):
                 " FROM entries WHERE kind='note' ORDER BY id"
             )
             conn.execute("PRAGMA user_version=3")
+        if current < 4:
+            # Memory L6 (EV v3 · 2026-06-05): learning gets history's sister
+            # table — "history 는 forensic 책임, learning 은 같은 벽에 부딪힌
+            # 자매면 누구든 끌어 쓰는 cross-session 참조". Nothing is copied or
+            # rewritten: a pre-v4 learning keeps its entries row and free
+            # body, and a v3 client ignores this table, so a rollback is only
+            # `PRAGMA user_version=3`. Its FTS index is built after the
+            # migration (_ensure_learning_index), as entries' is, so a SQLite
+            # without FTS5 still migrates and searches with LIKE.
+            conn.execute(_LEARNING_ENTRIES_TABLE)
+            conn.execute("PRAGMA user_version=4")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _ensure_learning_index(conn):
+    """Build the learnings FTS index once, complete, or not at all.
+
+    An external-content FTS5 table created beside rows that already exist
+    indexes none of them, and a search that then finds only newer rows hides
+    the older ones (Memory L6 re-audit F2, 2026-09-08, reproduced on
+    ``entries_fts``). So the index, its triggers and a rebuild from
+    ``learning_entries`` commit in one transaction: a cut or a failure leaves
+    no index, and the next connect builds it again. Raises
+    sqlite3.OperationalError without FTS5, which connect() treats as the LIKE
+    fallback.
+    """
+    probe = (
+        "SELECT 1 FROM sqlite_master"
+        " WHERE type='table' AND name='learning_entries_fts'"
+    )
+    if conn.execute(probe).fetchone() is not None:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Another short-lived CLI may have built it while this one waited.
+        if conn.execute(probe).fetchone() is None:
+            for statement in _LEARNING_FTS_SCHEMA:
+                conn.execute(statement)
+            conn.execute(
+                "INSERT INTO learning_entries_fts(learning_entries_fts)"
+                " VALUES('rebuild')"
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -400,6 +522,7 @@ def connect(path=None):
         raise
     try:  # FTS5 ships with macOS/homebrew sqlite; degrade to LIKE search without it
         conn.executescript(_FTS_SCHEMA)
+        _ensure_learning_index(conn)
         FTS_OK = True
     except sqlite3.OperationalError:
         FTS_OK = False
@@ -490,11 +613,17 @@ def add_entry(conn, kind, title, body="", project=None, agent=None,
 
     A todo carries an optional ``assignee``; an unassigned todo is anyone's
     (every brief lists it). A note is not an entry since schema v3 —
-    ``add_letter`` owns it.
+    ``add_letter`` owns it — and a new learning is not one since schema v4:
+    ``add_learning`` writes it typed (the entries kind stays readable for the
+    learnings written before).
     """
     if kind == "note":
         raise ValueError(
             "a note is a letter since coop schema v3 — use add_letter()",
+        )
+    if kind == "learning":
+        raise ValueError(
+            "a learning is typed since coop schema v4 — use add_learning()",
         )
     if kind not in ENTRY_KINDS:
         raise ValueError("kind must be one of: %s" % ", ".join(ENTRY_KINDS))
@@ -518,22 +647,29 @@ def add_entry(conn, kind, title, body="", project=None, agent=None,
 
 
 def set_commit_sha(conn, entry_id, commit_sha):
-    """Backfill the git head onto a history/learning entry after the commit.
+    """Backfill the git head onto a history entry or a learning after the commit.
 
-    Returns True if a row changed. Todos (and the frozen pre-v3 note rows)
-    have no commit identity and are refused so a typo'd id cannot silently
-    decorate the wrong kind.
+    Returns True if a row changed. A learning is a typed row since schema v4
+    and an entries row before it; the shared id space names at most one of
+    them. Todos, letters (and the frozen pre-v3 note rows) have no commit
+    identity and are refused so a typo'd id cannot silently decorate the
+    wrong kind.
     """
     sha = (commit_sha or "").strip()
     if not sha:
         raise ValueError("commit_sha must be non-empty")
-    cur = conn.execute(
+    changed = conn.execute(
         "UPDATE entries SET commit_sha=?, updated_at=? "
         "WHERE id=? AND kind IN ('history','learning')",
         (sha, now_iso(), entry_id),
-    )
+    ).rowcount
+    if not changed:
+        changed = conn.execute(
+            "UPDATE learning_entries SET commit_sha=? WHERE id=?",
+            (sha, entry_id),
+        ).rowcount
     conn.commit()
-    return cur.rowcount > 0
+    return changed > 0
 
 
 def set_status(conn, entry_id, new_status):
@@ -689,6 +825,7 @@ def list_projects(conn):
         "SELECT project FROM ("
         " SELECT project FROM entries"
         " UNION SELECT project FROM letters"
+        " UNION SELECT project FROM learning_entries"
         " UNION SELECT project FROM messages"
         " UNION SELECT project FROM reviews"
         ") ORDER BY project",
@@ -698,36 +835,42 @@ def list_projects(conn):
 # ---------------------------------------------------------------- letters
 # Memory L6 handoffs: past-self → future-self notes with their own six-state
 # machine (LETTER_TRANSITIONS). The table shares one id space with
-# ``entries`` (_next_ledger_id), so a bare "coop #N" names exactly one row.
-# Every move is an explicit command; nothing here polls, claims or notifies.
+# ``entries`` and ``learning_entries`` (_next_ledger_id), so a bare
+# "coop #N" names exactly one row. Every move is an explicit command; nothing
+# here polls, claims or notifies.
 
 
 def _next_ledger_id(conn):
-    """Next id in the id space ``letters`` shares with ``entries``.
+    """Next id in the id space ``letters`` and ``learning_entries`` share
+    with ``entries``.
 
     Runs inside the caller's write transaction. A pre-v3 note already has an
-    entries id and kept it as its letter id; a new letter takes the next id
-    past every entry and letter ever issued (AUTOINCREMENT sequences
-    included, so a deleted row's number is never reused).
+    entries id and kept it as its letter id; a new letter or learning takes
+    the next id past every entry, letter and learning ever issued
+    (AUTOINCREMENT sequences included, so a deleted row's number is never
+    reused).
     """
     row = conn.execute(
         "SELECT MAX(n) FROM ("
         " SELECT MAX(id) AS n FROM entries"
         " UNION ALL SELECT MAX(id) FROM letters"
+        " UNION ALL SELECT MAX(id) FROM learning_entries"
         " UNION ALL SELECT seq FROM sqlite_sequence"
-        " WHERE name IN ('entries','letters'))",
+        " WHERE name IN ('entries','letters','learning_entries'))",
     ).fetchone()
     return int(row[0] or 0) + 1
 
 
 def _reserve_entry_id(conn, ledger_id):
-    """Raise the entries AUTOINCREMENT floor past a letter's id.
+    """Raise the entries AUTOINCREMENT floor past a letter's or learning's id.
 
     Otherwise the next entry — written by this module or by any other writer
-    relying on AUTOINCREMENT — would reuse the letter's number, and a
+    relying on AUTOINCREMENT — would reuse that number, and a
     `coop.py done <id>` typed from a letter's receipt could close an
-    unrelated todo. SQLite documents ordinary UPDATE/INSERT on
-    sqlite_sequence; the value only ever grows here.
+    unrelated todo. It also keeps a v3 client, after a rollback, from
+    reusing a learning's id: its own allocation reads this floor. SQLite
+    documents ordinary UPDATE/INSERT on sqlite_sequence; the value only ever
+    grows here.
     """
     conn.execute(
         "UPDATE sqlite_sequence SET seq=? WHERE name='entries' AND seq<?",
@@ -974,6 +1117,113 @@ def letter_counts(conn, *, project=None, addressed_to=None):
     return counts
 
 
+# ---------------------------------------------------------------- learnings
+# Memory L6 typed learnings (schema v4), history's sister table. History is
+# the forensic record of what a session did; a learning is the cross-session
+# reference any sister who hits the same wall can pull. One ledger id space
+# with entries and letters (_next_ledger_id).
+
+
+def add_learning(conn, slug, *, problem, resolution, hypothesis="", source="",
+                 scope="", author_agent=None, project=None, commit_sha=None):
+    """Write one typed learning and return its id.
+
+    ``slug`` names the symptom and ``scope`` the framework or language. The
+    lesson names the columns but not which are required; a learning without
+    its problem or its resolution teaches nothing, so both are required and
+    the rest are optional. Every text is stripped. ``commit_sha`` is for a
+    writer that already knows its head; the entry-first flow backfills it
+    with ``set_commit_sha``.
+    """
+    text = {
+        name: (value or "").strip()
+        for name, value in (
+            ("slug", slug), ("problem", problem), ("resolution", resolution),
+            ("hypothesis", hypothesis), ("source", source), ("scope", scope),
+        )
+    }
+    for name in ("slug", "problem", "resolution"):
+        if not text[name]:
+            raise ValueError("a learning needs a non-empty %s" % name)
+    author = (author_agent or "").strip() or detect_agent()
+    owner = project or detect_project()
+    created = now_iso()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        learning_id = _next_ledger_id(conn)
+        conn.execute(
+            "INSERT INTO learning_entries (id, project, author_agent, scope,"
+            " slug, problem, hypothesis, resolution, source, commit_sha,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (learning_id, owner, author, text["scope"], text["slug"],
+             text["problem"], text["hypothesis"], text["resolution"],
+             text["source"], (commit_sha or "").strip(), created),
+        )
+        _reserve_entry_id(conn, learning_id)
+        conn.commit()
+        return learning_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_learning(conn, learning_id):
+    """Return one typed learning row, or None."""
+    return conn.execute(
+        "SELECT * FROM learning_entries WHERE id=?", (learning_id,),
+    ).fetchone()
+
+
+def list_learnings(conn, *, query=None, project=None, scope=None, limit=100):
+    """Return typed learnings: FTS-ranked for a query, newest otherwise.
+
+    ``project`` and ``scope`` apply before LIMIT, as every entries filter
+    does. A query searches every LEARNING_TEXT_FIELDS column; when FTS5 is
+    unavailable or its index finds nothing, each query term must appear in
+    one of them (LIKE).
+    """
+    where, params = [], []
+    for column, value in (("project", project), ("scope", scope)):
+        if value is not None:
+            where.append("l.%s=?" % column)
+            params.append(value)
+    terms = (query or "").split()
+    if terms and FTS_OK:
+        fts_sql = (
+            "SELECT l.* FROM learning_entries_fts f"
+            " JOIN learning_entries l ON l.id=f.rowid"
+            " WHERE learning_entries_fts MATCH ?"
+            + "".join(" AND " + clause for clause in where)
+            + " ORDER BY rank LIMIT ?"
+        )
+        match = " ".join('"%s"' % term.replace('"', "") for term in terms)
+        try:
+            rows = conn.execute(fts_sql, [match, *params, limit]).fetchall()
+            if rows:
+                return rows
+        except sqlite3.OperationalError:
+            pass
+    for term in terms:
+        where.append("(%s)" % " OR ".join(
+            "l.%s LIKE ?" % column for column in LEARNING_TEXT_FIELDS
+        ))
+        params.extend(["%" + term + "%"] * len(LEARNING_TEXT_FIELDS))
+    sql = "SELECT l.* FROM learning_entries l"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY l.id DESC LIMIT ?"
+    return conn.execute(sql, [*params, limit]).fetchall()
+
+
+def learning_counts(conn, *, project=None):
+    """The typed learnings' ``total`` (in ``project`` when given)."""
+    total = conn.execute(
+        "SELECT COUNT(*) FROM learning_entries WHERE (? IS NULL OR project=?)",
+        (project, project),
+    ).fetchone()[0]
+    return {"total": total}
+
+
 # ---------------------------------------------------------------- mailbox
 # The mailbox is the deterministic substrate for agent collaboration.  It
 # guarantees delivery, addressing, threading, exact artifact references and
@@ -1194,14 +1444,6 @@ def list_root_messages_with_artifact(conn, *, project, artifact_ref):
         "AND artifact_refs LIKE ? ORDER BY id DESC",
         (project, "%" + artifact_ref + "%"),
     ).fetchall()
-
-
-def project_message_high_water(conn):
-    """Return {project: max message id} — the outbox sweep's cheap cursor map."""
-    rows = conn.execute(
-        "SELECT project, MAX(id) AS max_id FROM messages GROUP BY project",
-    ).fetchall()
-    return {str(row["project"]): int(row["max_id"] or 0) for row in rows}
 
 
 def message_counts(conn, *, project=None, recipient_agent=None):
@@ -1661,9 +1903,33 @@ def cmd_add(args, kind):
         conn.close()
     suffix = (" (assigned to %s)" % row["assignee"]) if kind == "todo" else ""
     print("coop #%d %s recorded — %s%s" % (entry_id, kind, slug, suffix))
-    if kind in ("history", "learning") and not getattr(args, "sha", None):
+    if kind == "history" and not getattr(args, "sha", None):
         print("(entry-first flow: after the commit lands, backfill with "
               "`coop.py sha %d <head>`)" % entry_id)
+
+
+def cmd_learn(args):
+    """`learn` writes a typed learning (schema v4); '-' reads a field from stdin."""
+    conn = connect()
+    try:
+        learning_id = add_learning(
+            conn, args.slug,
+            problem=read_body(args.problem),
+            resolution=read_body(args.resolution),
+            hypothesis=read_body(args.hypothesis),
+            source=read_body(args.source),
+            scope=args.scope,
+            author_agent=args.agent, project=args.project, commit_sha=args.sha,
+        )
+        row = get_learning(conn, learning_id)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    finally:
+        conn.close()
+    print("coop #%d learning recorded — %s" % (learning_id, row["slug"]))
+    if not args.sha:
+        print("(entry-first flow: after the commit lands, backfill with "
+              "`coop.py sha %d <head>`)" % learning_id)
 
 
 def cmd_note(args):
@@ -1724,7 +1990,7 @@ def cmd_sha(args):
     except ValueError as exc:
         sys.exit(str(exc))
     if not changed:
-        sys.exit("no history/learning entry with id %d" % args.id)
+        sys.exit("no history entry or learning with id %d" % args.id)
     print("coop #%d sha=%s" % (args.id, args.commit_sha))
 
 
@@ -1776,8 +2042,26 @@ def print_letter(row):
         print("\nsuperseded by letter #%d" % row["superseded_by"])
 
 
+def format_learning(row):
+    symptom = "%s: %s" % (row["scope"], row["slug"]) if row["scope"] else row["slug"]
+    return "#%-4d %-8s %s  %s · %s · %s" % (
+        row["id"], "learning", row["created_at"][:16].replace("T", " "),
+        symptom, row["project"], row["author_agent"],
+    )
+
+
+def print_learning(row):
+    print(format_learning(row))
+    if row["commit_sha"]:
+        print("commit: %s" % row["commit_sha"])
+    for field in ("problem", "hypothesis", "resolution", "source"):
+        if row[field]:
+            print("\n%s: %s" % (field, row[field]))
+
+
 def cmd_recent(args):
-    """Newest entries and letters, interleaved by their shared ledger id."""
+    """Newest entries, typed learnings and letters, interleaved by their
+    shared ledger id."""
     conn = connect()
     project = None if args.all_projects else detect_project(args.project)
     lines = []
@@ -1785,6 +2069,11 @@ def cmd_recent(args):
         lines.extend(
             (r["id"], format_row(r))
             for r in list_entries(conn, kind=args.kind, project=project, limit=args.n)
+        )
+    if args.kind in (None, "learning"):
+        lines.extend(
+            (row["id"], format_learning(row))
+            for row in list_learnings(conn, project=project, limit=args.n)
         )
     if args.kind in (None, "note"):
         lines.extend(
@@ -1807,12 +2096,19 @@ def cmd_search(args):
     rows = [] if args.kind == "note" else list_entries(
         conn, query=args.query, kind=args.kind, project=project, limit=args.n,
     )
+    # Retrieval-first ("what did this framework teach?"): the typed
+    # learnings print ahead of the entries a query also matched.
+    learnings = list_learnings(
+        conn, query=args.query, project=project, limit=args.n,
+    ) if args.kind in (None, "learning") else []
     letters = list_letters(
         conn, query=args.query, project=project, limit=args.n,
     ) if args.kind in (None, "note") else []
     conn.close()
-    if not rows and not letters:
+    if not rows and not learnings and not letters:
         print("coop: no match for %r" % args.query)
+    for row in learnings:
+        print(format_learning(row))
     for r in rows:
         print(format_row(r))
     for row in letters:
@@ -1823,9 +2119,13 @@ def cmd_show(args):
     conn = connect()
     r = get_entry(conn, args.id)
     letter = get_letter(conn, args.id)
+    learning = get_learning(conn, args.id)
     conn.close()
-    if r is None and letter is None:
-        sys.exit("no entry or letter with id %d" % args.id)
+    if r is None and letter is None and learning is None:
+        sys.exit("no entry, learning or letter with id %d" % args.id)
+    if learning is not None:
+        print_learning(learning)
+        return
     if letter is not None:
         print_letter(letter)
         if r is not None and r["kind"] == "note":
@@ -2177,11 +2477,20 @@ def cmd_brief(args):
                 print("  " + format_row(r))
             if len(todos) > BRIEF_ITEM_LIMIT:
                 print("  … more — `coop.py recent --kind todo -n 50`")
-        recent = list_entries(conn, project=project, limit=args.n)
+        # A learning is typed since schema v4, no longer an entry: interleave
+        # both by their shared ledger id so a fresh learning stays on the card.
+        recent = [
+            (r["id"], format_row(r))
+            for r in list_entries(conn, project=project, limit=args.n)
+        ] + [
+            (row["id"], format_learning(row))
+            for row in list_learnings(conn, project=project, limit=args.n)
+        ]
+        recent.sort(key=lambda item: item[0], reverse=True)
         if recent:
             print("Recent  : (project %s)" % project)
-            for r in recent:
-                print("  " + format_row(r))
+            for _id, line in recent[:args.n]:
+                print("  " + line)
         inbox = list_messages(
             conn, project=project, status=ACTIVE_MESSAGE_STATUSES,
             recipient_agent=agent, limit=5,
@@ -2193,7 +2502,8 @@ def cmd_brief(args):
         conn.close()
         print("Rules   : per work unit → `coop.py log` BEFORE the commit,"
               " then commit+push, then `coop.py sha <id> <head>`;"
-              " non-obvious lesson → `coop.py learn`;"
+              " non-obvious lesson → `coop.py learn <symptom-slug>"
+              " --problem … --resolution …`;"
               " handoff → `coop.py note` (a letter: `letter read` →"
               " `letter start <id>` → `letter ack <id> --body …`);"
               " optional collaboration → `coop.py send/inbox/reply`;"
@@ -2234,15 +2544,43 @@ def main(argv=None):
         s.add_argument("--slug")
         s.add_argument("--project")
         s.add_argument("--agent")
-        if name in ("log", "learn"):
+        if name == "log":
             s.add_argument("--sha", help="git head when already known "
                            "(machine writers / retroactive records)")
         if name == "todo":
             s.add_argument("--assignee", help="who should do it (default: you)")
         return s
 
-    for name in ("log", "learn", "todo"):
+    for name in ("log", "todo"):
         add_writer(name)
+
+    s = sub.add_parser(
+        "learn",
+        help="record a typed learning (schema v4)",
+        description=(
+            "Record what a framework taught when it blocked the work "
+            "(Memory L6 learning_entries). The lesson names the columns - "
+            "scope, slug, problem, hypothesis, resolution, source - but not "
+            "which are required; Forrest requires --problem and --resolution "
+            "and leaves the rest optional. '-' as a value reads that field "
+            "from stdin."
+        ),
+    )
+    s.add_argument("slug", help="the symptom's name, e.g. fts-lost-after-alter")
+    s.add_argument("--problem", required=True,
+                   help="required: what broke, as it showed itself")
+    s.add_argument("--resolution", required=True,
+                   help="required: what fixed it, and the rule to keep")
+    s.add_argument("--hypothesis", default="",
+                   help="optional: what you suspected on the way")
+    s.add_argument("--source", default="",
+                   help="optional: where the answer came from (docs, issue, commit)")
+    s.add_argument("--scope", default="",
+                   help="optional: the framework or language (sqlite, tauri, mps)")
+    s.add_argument("--sha", help="git head when already known "
+                   "(machine writers / retroactive records)")
+    s.add_argument("--project")
+    s.add_argument("--agent")
 
     s = sub.add_parser("note", help="write a handoff letter (schema v3)")
     s.add_argument("title", help="letter subject")
@@ -2366,9 +2704,11 @@ def main(argv=None):
     s.add_argument("--agent")
 
     args = p.parse_args(argv)
-    kind_map = {"log": "history", "learn": "learning", "todo": "todo"}
+    kind_map = {"log": "history", "todo": "todo"}
     if args.cmd in kind_map:
         cmd_add(args, kind_map[args.cmd])
+    elif args.cmd == "learn":
+        cmd_learn(args)
     elif args.cmd == "note":
         cmd_note(args)
     elif args.cmd == "assign":
