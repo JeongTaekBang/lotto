@@ -1694,41 +1694,11 @@ def _migrate_legacy_reviews(conn):
 
 
 # ------------------------------------------------ legacy review compatibility
-# Kept so older databases and /api/coop/reviews readers remain intact while
-# connect() projects every row into the generic mailbox.  No CLI command or
-# model runner creates/dispatches this specialized workflow anymore.
-
-
-def add_review(conn, title, *, body="", project=None, requester_agent=None,
-               reviewer_agent=None, reviewer_model="", machine=None,
-               base_sha="", head_sha=""):
-    """Create one legacy review row and return its id."""
-    if not title.strip():
-        raise ValueError("review title must not be empty")
-    if not reviewer_agent or not reviewer_agent.strip():
-        raise ValueError("legacy review reviewer_agent must not be empty")
-    if not head_sha.strip():
-        raise ValueError("review head_sha must not be empty")
-    created = now_iso()
-    cur = conn.execute(
-        "INSERT INTO reviews (project, requester_agent, reviewer_agent,"
-        " reviewer_model, machine, title, body, base_sha, head_sha, status,"
-        " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,'open',?,?)",
-        (
-            project or detect_project(), requester_agent or detect_agent(),
-            reviewer_agent, reviewer_model or "", machine or detect_machine(),
-            title.strip(), body or "", base_sha or "", head_sha,
-            created, created,
-        ),
-    )
-    conn.commit()
-    return cur.lastrowid
-
-
-def get_review(conn, review_id):
-    return conn.execute(
-        "SELECT * FROM reviews WHERE id=?", (review_id,),
-    ).fetchone()
+# Read-only: the reviews/review_rounds tables are kept so older databases and
+# the /api/coop/reviews readers remain intact while connect() projects every
+# row into the generic mailbox.  Nothing writes them any more — the writer
+# family (add/claim/submit/resubmit/release) had no CLI command or route and
+# left with the 2026-09-24 refinement; a legacy ledger already holds its rows.
 
 
 def list_review_rounds(conn, review_id):
@@ -1773,121 +1743,6 @@ def review_counts(conn, *, project=None):
     counts["total"] = sum(counts.values())
     counts["attention"] = counts["open"] + counts["claimed"] + counts["changes_requested"]
     return counts
-
-
-def claim_review(conn, review_id, reviewer_agent):
-    """Atomically claim an open request for its named reviewer."""
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        row = get_review(conn, review_id)
-        if row is None:
-            raise ValueError("no review with id %d" % review_id)
-        if row["reviewer_agent"] != reviewer_agent:
-            raise ValueError(
-                "review #%d targets %s, not %s" % (
-                    review_id, row["reviewer_agent"], reviewer_agent,
-                )
-            )
-        if row["status"] != "open":
-            raise ValueError(
-                "review #%d is %s, not open" % (review_id, row["status"])
-            )
-        cur = conn.execute(
-            "UPDATE reviews SET status='claimed', claimed_by=?, last_error='',"
-            " updated_at=? WHERE id=? AND status='open'",
-            (reviewer_agent, now_iso(), review_id),
-        )
-        if cur.rowcount != 1:  # pragma: no cover - BEGIN IMMEDIATE serializes
-            raise ValueError("review #%d was claimed concurrently" % review_id)
-        conn.commit()
-        return get_review(conn, review_id)
-    except Exception:
-        conn.rollback()
-        raise
-
-
-def release_review(conn, review_id, reviewer_agent, error):
-    """Return a failed dispatch to the durable queue without losing context."""
-    cur = conn.execute(
-        "UPDATE reviews SET status='open', claimed_by='', last_error=?,"
-        " updated_at=? WHERE id=? AND status='claimed' AND claimed_by=?",
-        ((error or "review dispatch failed")[:4000], now_iso(), review_id,
-         reviewer_agent),
-    )
-    conn.commit()
-    return cur.rowcount == 1
-
-
-def submit_review(conn, review_id, reviewer_agent, verdict, body="",
-                  reviewer_model=""):
-    """Persist a verdict for the exact claimed head and advance lifecycle."""
-    if verdict not in REVIEW_VERDICTS:
-        raise ValueError("verdict must be one of: %s" % ", ".join(REVIEW_VERDICTS))
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        row = get_review(conn, review_id)
-        if row is None:
-            raise ValueError("no review with id %d" % review_id)
-        if row["status"] != "claimed" or row["claimed_by"] != reviewer_agent:
-            raise ValueError(
-                "review #%d is not claimed by %s" % (review_id, reviewer_agent)
-            )
-        created = now_iso()
-        conn.execute(
-            "INSERT INTO review_rounds (review_id, reviewer_agent, reviewer_model,"
-            " head_sha, verdict, body, created_at) VALUES (?,?,?,?,?,?,?)",
-            (
-                review_id, reviewer_agent,
-                reviewer_model or row["reviewer_model"], row["head_sha"],
-                verdict, body or "", created,
-            ),
-        )
-        conn.execute(
-            "UPDATE reviews SET status=?, claimed_by='', last_error='',"
-            " updated_at=? WHERE id=?",
-            (verdict, created, review_id),
-        )
-        conn.commit()
-        return get_review(conn, review_id)
-    except Exception:
-        conn.rollback()
-        raise
-
-
-def resubmit_review(conn, review_id, requester_agent, head_sha, body=None):
-    """Re-open a changes-requested review at a new exact Git head."""
-    if not head_sha.strip():
-        raise ValueError("review head_sha must not be empty")
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        row = get_review(conn, review_id)
-        if row is None:
-            raise ValueError("no review with id %d" % review_id)
-        if row["requester_agent"] != requester_agent:
-            raise ValueError(
-                "review #%d belongs to requester %s" % (
-                    review_id, row["requester_agent"],
-                )
-            )
-        if row["status"] not in ("open", "changes_requested"):
-            raise ValueError(
-                "review #%d is %s, not open/changes_requested" % (
-                    review_id, row["status"],
-                )
-            )
-        if row["head_sha"] == head_sha:
-            raise ValueError("review #%d already covers %s" % (review_id, head_sha[:12]))
-        next_body = row["body"] if body is None else body
-        conn.execute(
-            "UPDATE reviews SET head_sha=?, body=?, status='open', claimed_by='',"
-            " last_error='', updated_at=? WHERE id=?",
-            (head_sha, next_body, now_iso(), review_id),
-        )
-        conn.commit()
-        return get_review(conn, review_id)
-    except Exception:
-        conn.rollback()
-        raise
 
 
 # ---------------------------------------------------------------- commands
