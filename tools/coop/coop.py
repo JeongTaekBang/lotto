@@ -14,8 +14,8 @@ plus abandoned / superseded. `note` writes one (optionally `--to` an agent;
 without a recipient it is for any future session of the project). The
 session ritual is `letter read` (the only command that marks letters read),
 `letter start <id>` when acting on one, `letter ack <id> --body …` when it
-shipped. Nothing here polls, claims or notifies: every transition is an
-explicit command in an instance session (Memory L6: 아빠 is the coordinator).
+shipped. Unregistered sessions keep these explicit transitions. Memory L10's
+office engine separately tracks obligations for explicitly assigned sessions.
 
 Learnings are history's typed sister table (schema v4, Memory L6
 `learning_entries`): history asks what a session did, a learning what a
@@ -45,9 +45,11 @@ turns. Separately, the backend exposes
 the same storage API to Admin and app-Forrest body-work turns; that is an
 explicit coop surface, not filesystem-setting inheritance.
 
-Stdlib only (sqlite3/argparse), runs on macOS system python3. Short-lived
-CLI processes over one WAL file — concurrent writers are safe via
-busy_timeout, no daemon, no server.
+Stdlib only. bjtCoop owns this source and exports a pinned single-file bundle
+for existing callers. An adopted ledger routes mutations to its private
+loopback office. Reads remain local and writes fail closed when the office
+cannot acknowledge them. Isolated, unadopted ledgers retain the original
+in-process storage API for migration and tests.
 
 Env: COOP_DB_PATH (default $HOME/forrest-db/coop.db, override for tests),
      COOP_GROUND_TRUTH_HOST (default the declared server below),
@@ -55,6 +57,8 @@ Env: COOP_DB_PATH (default $HOME/forrest-db/coop.db, override for tests),
 """
 
 import argparse
+import functools
+import inspect
 from contextlib import contextmanager
 import datetime as dt
 import fcntl
@@ -66,6 +70,8 @@ import sqlite3
 import subprocess
 import sys
 import uuid
+from pathlib import Path
+from urllib import error as urlerror, request as urlrequest
 
 GROUND_TRUTH_HOST = "Jeongtaeks-Mac-Studio"  # BJT's Mac Studio — the always-on server
 DEFAULT_DB = os.path.join(os.path.expanduser("~"), "forrest-db", "coop.db")
@@ -125,14 +131,22 @@ def _managed_work_result_guard(
     *,
     target_message_id=None,
     fallback_message_id=None,
+    environ=None,
 ):
     """Fence a managed result against a concurrent generation rotation."""
-    if intent != "work_result" or os.environ.get("FORREST_WORKSPACE") != "1":
+    # A remote writer holds this fence in the office process, through commit.
+    # Holding it here too would deadlock; timing out here must not release the
+    # office's guard while its write is still in flight.
+    if environ is None and owner_path().exists():
         yield
         return
-    runtime_raw = os.environ.get("FORREST_WORK_RUNTIME_PATH", "").strip()
-    token = os.environ.get("FORREST_WORK_SESSION_TOKEN", "").strip()
-    generation = os.environ.get("FORREST_WORK_GENERATION", "").strip()
+    environ = os.environ if environ is None else environ
+    if intent != "work_result" or environ.get("FORREST_WORKSPACE") != "1":
+        yield
+        return
+    runtime_raw = environ.get("FORREST_WORK_RUNTIME_PATH", "").strip()
+    token = environ.get("FORREST_WORK_SESSION_TOKEN", "").strip()
+    generation = environ.get("FORREST_WORK_GENERATION", "").strip()
     if not runtime_raw or not token or not generation.isdigit():
         raise ValueError("managed work_result is missing its runtime fence")
     lock_path = runtime_raw + ".lock"
@@ -503,13 +517,57 @@ def _ensure_fts_index(conn, table, statements):
         raise
 
 
-def connect(path=None):
+class CoopConnection(sqlite3.Connection):
+    """Connection-local routing; ownership never lives in a process-global flag."""
+
+    office_writer = False
+    office_owned = False
+    db_path = ""
+    office_batch = False
+
+    def execute(self, sql, parameters=()):
+        if self.office_batch and sql.strip().upper().startswith("BEGIN"):
+            return super().execute("SELECT 1")
+        return super().execute(sql, parameters)
+
+    def commit(self):
+        if not self.office_batch:
+            super().commit()
+
+    def rollback(self):
+        if not self.office_batch:
+            super().rollback()
+
+
+def owner_path(path=None):
+    return Path(str(path or os.environ.get("COOP_DB_PATH") or DEFAULT_DB) + ".owner.json")
+
+
+def connect(path=None, *, _office_writer=False):
     global FTS_OK
-    db_path = path or os.environ.get("COOP_DB_PATH") or DEFAULT_DB
+    db_path = os.path.abspath(path or os.environ.get("COOP_DB_PATH") or DEFAULT_DB)
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, factory=CoopConnection)
+    conn.db_path = db_path
+    conn.office_writer = _office_writer
     conn.row_factory = sqlite3.Row
+    owned = owner_path(db_path).exists() or conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name='coop_office' AND type='table'",
+    ).fetchone() is not None
+    conn.office_owned = owned
+    # Every protected row mutation, including a statement prepared before
+    # cutover, must resolve this function on THAT connection. Legacy clients
+    # have no such function and SQLite rejects their write.
+    conn.create_function("coop_writer_authorized", 0, lambda: int(conn.office_writer))
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    if owned and not _office_writer:
+        conn.execute("PRAGMA query_only=ON")
+        FTS_OK = conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' "
+            "AND name IN ('entries_fts','learning_entries_fts')",
+        ).fetchone()[0] == 2
+        return conn
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
@@ -2611,5 +2669,161 @@ def main(argv=None):
         cmd_message_done(args)
 
 
+# This file is the generated, standalone compatibility bundle. bjtCoop owns
+# its source; callers keep their established imports and CLI vocabulary.
+WRITE_METHODS = (
+    "add_entry", "set_commit_sha", "set_status", "assign_todo",
+    "add_letter", "transition_letter", "read_letters", "add_learning",
+    "add_message", "add_message_once", "claim_message", "release_message",
+    "finish_message", "reply_message",
+)
+WORKSPACE_FENCE_KEYS = (
+    "FORREST_WORKSPACE", "FORREST_WORK_RUNTIME_PATH", "FORREST_WORK_SESSION_TOKEN",
+    "FORREST_WORK_GENERATION", "FORREST_WORK_UNIT_MESSAGE_ID",
+)
+
+
+class OfficeCallError(RuntimeError):
+    """A write was not acknowledged; receipt_id is the reconciliation key."""
+
+    def __init__(self, receipt):
+        self.receipt = receipt
+        super().__init__("Coop %s (HTTP %s, receipt %s): %s" % (
+            receipt["verdict"], receipt.get("http_status", "unknown"),
+            receipt["request_id"], receipt.get("error", "office unavailable"),
+        ))
+
+
+class OfficeRejected(OfficeCallError, ValueError):
+    pass
+
+
+def _read_owner(path):
+    with owner_path(path).open(encoding="utf-8") as handle:
+        owner = json.load(handle)
+    if (not isinstance(owner, dict) or owner.get("protocol") != 1
+            or not re.fullmatch(r"http://127\.0\.0\.1:[0-9]{1,5}", owner.get("url", ""))
+            or not isinstance(owner.get("token"), str) or len(owner["token"]) < 32
+            or not isinstance(owner.get("instance"), str)):
+        raise ValueError("invalid Coop owner descriptor")
+    return owner
+
+
+def _save_receipt(path, receipt):
+    directory = Path(str(path) + ".receipts")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    destination = directory / (receipt["request_id"] + ".json")
+    temporary = destination.with_suffix(".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(receipt, handle, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, destination)
+
+
+class _NoRedirect(urlrequest.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def office_call(method, params=None, *, path=None, mutating=True, request_id=None):
+    """Call the sole writer once. Never replay or fall back to raw SQLite.
+
+    An uncertain request is reconciled using office_receipt, not repeated
+    with a fresh identity. The original receipt is durable before dispatch.
+    """
+    db_path = os.path.abspath(path or os.environ.get("COOP_DB_PATH") or DEFAULT_DB)
+    rid = request_id or str(uuid.uuid4())
+    if str(uuid.UUID(rid)) != rid:
+        raise ValueError("invalid request id")
+    receipt = {"request_id": rid, "method": method, "verdict": "uncertain"}
+    if mutating:
+        _save_receipt(db_path, receipt)
+    status = None
+    try:
+        owner = _read_owner(db_path)
+        payload = {"request_id": rid, "method": method, "params": params or {},
+                   "workspace_fence": {k: os.environ[k] for k in WORKSPACE_FENCE_KEYS if k in os.environ}}
+        req = urlrequest.Request(
+            owner["url"] + "/rpc", data=json.dumps(payload).encode(),
+            headers={"Authorization": "Bearer " + owner["token"],
+                     "Content-Type": "application/json"}, method="POST",
+        )
+        opener = urlrequest.build_opener(urlrequest.ProxyHandler({}), _NoRedirect())
+        try:
+            response = opener.open(req, timeout=15)
+        except urlerror.HTTPError as exc:
+            response = exc
+        with response:
+            status = response.status
+            if status in (401, 403, 422):
+                receipt.update(verdict="rejected", http_status=status)
+            raw = response.read(2 * 1024 * 1024 + 1)
+        try:
+            domain = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            domain = None
+        valid = (isinstance(domain, dict) and domain.get("request_id") == rid
+                 and domain.get("instance") == owner["instance"])
+        if valid and status == 200 and domain.get("verdict") == "committed" and "result" in domain:
+            receipt.update(verdict="committed", http_status=status)
+            if mutating:
+                _save_receipt(db_path, receipt)
+            return domain["result"]
+        receipt.update(http_status=status,
+                       verdict="rejected" if status in (401, 403, 422) else "uncertain",
+                       error="office did not return a valid committed verdict")
+        if valid and domain.get("verdict") == "rejected":
+            receipt.update(verdict="rejected", error=domain.get("error", "rejected"))
+            error_kind = domain.get("error_type")
+            if mutating:
+                _save_receipt(db_path, receipt)
+            if error_kind == "LetterNotFound":
+                raise LetterNotFound(receipt["error"])
+            if error_kind == "LetterTransitionError":
+                raise LetterTransitionError(receipt["error"])
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, LetterTransitionError):
+            raise
+        receipt.update(error=str(exc), http_status=status)
+    if mutating:
+        _save_receipt(db_path, receipt)
+    raise (OfficeRejected if receipt["verdict"] == "rejected" else OfficeCallError)(receipt)
+
+
+def _office_writer(fn):
+    signature = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def routed(conn, *args, **kwargs):
+        owned = (getattr(conn, "office_owned", False)
+                 or owner_path(getattr(conn, "db_path", None)).exists())
+        if getattr(conn, "office_writer", False) or not owned:
+            return fn(conn, *args, **kwargs)
+        bound = signature.bind(conn, *args, **kwargs)
+        bound.apply_defaults()
+        params = dict(bound.arguments)
+        params.pop("conn")
+        # Resolve caller-local identity before crossing the process boundary.
+        for key, default in (("project", detect_project), ("agent", detect_agent),
+                             ("author_agent", detect_agent), ("sender_agent", detect_agent),
+                             ("machine", detect_machine)):
+            if key in params and not params[key]:
+                # None on read_letters means all projects, not caller project.
+                if fn.__name__ == "read_letters" and key == "project":
+                    continue
+                params[key] = default()
+        return office_call(fn.__name__, params, path=conn.db_path)
+    return routed
+
+
+for _name in WRITE_METHODS:
+    globals()[_name] = _office_writer(globals()[_name])
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except OfficeCallError as exc:
+        sys.exit(str(exc))

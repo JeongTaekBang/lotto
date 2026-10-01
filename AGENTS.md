@@ -6,14 +6,13 @@ body `lotto`. It is not a runtime sibling app, Soul, or Brain. Its durable
 descriptor remains `git_repository` / `app:lotto`; a future runtime sibling
 requires a separate host kind, pull adapter, and system folder. Git and the
 working tree remain the source of code truth; Forrest WebUI injects a verified
-read-only project view into its canonical conversation.
+read-only project view into each connected conversation.
 
-That canonical-home conversation owns the immutable `soul_id`; a managed
-WorkUnit carries it, while either terminal Brain reads only the selected Soul
-vault plus this project's bounded brief at SessionStart. The eligible source
-conversation normally becomes home, but an unavailable/already-bound or
-Council/global source receives a server-minted default-Soul home. Editable
-`source_ref` text is never identity authority. Without a managed WorkUnit, an
+Each requesting conversation owns its immutable `soul_id`. Git registration
+does not create a representative home. Existing managed WorkUnits keep their
+pinned Soul for recovery; the terminal reads only that selected Soul vault
+plus this project's bounded brief at SessionStart. Editable `source_ref` text
+is never identity authority. Without a managed WorkUnit, an
 ordinary terminal uses the current runtime-selected/default Soul and does not
 pin, bind, or adopt project identity.
 Nothing records that session or returns it to Forrest memory on its own; full
@@ -29,9 +28,9 @@ Before body work, run:
     python3 .forrest/session_start.py --verify-integration
 
 If it fails, stop and restore/upgrade the Forrest-owned protocol, hooks, or
-client. `.forrest/project.json` owns the typed `context_binding`; Forrest
-resolves it to one canonical home conversation, so do not derive or rewrite
-that address from a display label, path, or cwd.
+client. `.forrest/project.json` owns the typed `context_binding` for the
+development body; it does not appoint a representative conversation.
+Preserve any existing WorkUnit return address.
 
 On the ground-truth host the client needs read/write access to
 `$HOME/forrest-db/coop.db` and its parent directory. `COOP BRIEF UNAVAILABLE`
@@ -63,6 +62,6 @@ push rule. Then reply with `--intent work_result`, a concise
 result body, and `--ref "git-head:$(git rev-parse HEAD)"`. A reply without the
 result Git ref is incomplete. Codex uses `--agent codex`; Claude Code can rely
 on its automatic `claude-code` identity. Forrest writes a valid result to the
-canonical home JSONL before acknowledging it; do not manually paste or import
+recorded result conversation JSONL before acknowledging it; do not manually paste or import
 the returned work into chat.
 <!-- END:forrest-project-protocol -->
