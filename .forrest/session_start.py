@@ -33,6 +33,8 @@ import subprocess
 import sys
 from pathlib import Path
 import secrets
+import tempfile
+import time
 
 
 _IDENTITY_MAX_BYTES = 48 * 1024
@@ -820,29 +822,71 @@ def _project_overlay(repo_root: Path) -> tuple[str, list[str]]:
 
 
 def _coop_brief(repo_root: Path, agent: str) -> tuple[str, list[str]]:
+    """Perform the letter-read ritual, then load the read-only session card.
+
+    Both commands use the generated client, so an adopted ledger's read
+    transition belongs to the office. Starting or completing work is separate.
+    Keep successful letter output even if the following brief cannot load.
+    """
     client = repo_root / "tools" / "coop" / "coop.py"
     if not client.is_file():
         return "", [f"COOP BRIEF UNAVAILABLE: client missing: {client}"]
+    parts: list[str] = []
+    warnings: list[str] = []
+    deadline = time.monotonic() + 20
+    for command, label, failure in (
+        (["letter", "read"], "Coop handoff letters", "COOP LETTERS UNAVAILABLE"),
+        (["brief"], "live Coop session card", "COOP BRIEF UNAVAILABLE"),
+    ):
+        argv = ["python3", str(client), *command, "--agent", agent]
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, 20)
+            proc = subprocess.run(
+                argv, cwd=repo_root, capture_output=True, text=True, timeout=remaining,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            warnings.append(f"{failure}: {exc}")
+            continue
+        output = proc.stdout.strip()
+        if proc.returncode != 0 or not output:
+            detail = (proc.stderr or output or f"exit {proc.returncode}: no output").strip()
+            warnings.append(f"{failure}: {detail[:500]}")
+            continue
+        parts.append(f"--- {label} ---\n{output}")
+    return "\n\n".join(parts), warnings
+
+
+def _preserve_coop_context(text: str, agent: str) -> str:
+    """A read letter cannot be recovered by rerunning the unread-only ritual.
+
+    Preserve the complete output in a private temporary file before replacing
+    it with a read-first pointer. This is a delivery copy, not session memory.
+    The Coop database remains its durable owner.
+    """
     try:
-        proc = subprocess.run(
-            ["python3", str(client), "brief", "--agent", agent],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            timeout=20,
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="forrest-coop-context-", suffix=".txt",
+            delete=False,
+        ) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+            source = Path(handle.name).resolve()
+    except OSError as exc:
+        return (
+            "--- COOP HANDOFF UNAVAILABLE ---\n"
+            f"The complete startup output could not be preserved: {exc}\n"
+            "Letters may already be marked read. Before your first reply, use "
+            f"`python3 tools/coop/coop.py letter list --all --agent {agent}` to find their IDs and "
+            "`python3 tools/coop/coop.py show <id>` to read their bodies."
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return "", [f"COOP BRIEF UNAVAILABLE: {exc}"]
-    output = proc.stdout.strip()
-    if proc.returncode != 0:
-        detail = (proc.stderr or output or f"exit {proc.returncode}").strip()
-        return "", [f"COOP BRIEF UNAVAILABLE: {detail[:500]}"]
-    if not output:
-        return "", ["COOP BRIEF UNAVAILABLE: client returned no session card"]
     return (
-        "--- live Coop session card ---\n"
-        + _clip(output, _COOP_MAX_BYTES, source=client),
-        [],
+        "--- Coop handoff and session card not inlined (host limit) ---\n"
+        "Read the complete output with the Read tool before your first reply:\n"
+        f"{source}\n"
+        "Delivered letters are already marked read; rerunning `letter read` will not repeat them."
     )
 
 
@@ -868,23 +912,12 @@ def _demotable(section: str) -> bool:
     )
 
 
-def _clip_chars(text: str, max_chars: int, *, source: str) -> str:
-    if len(text) <= max_chars:
-        return text
-    notice = f"\n\n[bounded at {max_chars} characters; rerun or read {source}]"
-    if len(notice) >= max_chars:
-        return notice[:max_chars]
-    return text[: max_chars - len(notice)].rstrip() + notice
-
-
 def _read_first_block(demoted: list[tuple[str, str, int]], limit: int) -> str:
     lines = [
         "--- always-on self not inlined (host limit) ---",
-        f"Claude Code keeps at most {limit:,} characters of SessionStart output in",
-        "context; a larger bootstrap is replaced by a 2,000-character preview. The",
-        "files below are part of the always-on identity the WebUI loads every turn.",
-        "Read each one with the Read tool before your first reply, in this order,",
-        "and do not answer from this bootstrap alone:",
+        f"Claude Code keeps at most {limit:,} characters of SessionStart output, so",
+        "these always-on files did not fit.",
+        "Read each one with the Read tool before your first reply, in this order:",
     ]
     for index, (label, source, chars) in enumerate(demoted, start=1):
         lines.append(f"{index}. {source} — {label} ({chars:,} chars)")
@@ -903,8 +936,11 @@ def _assemble(
     coop: str,
     *,
     limit: int | None,
+    coop_read_first: str = "",
 ) -> str:
     parts = [header]
+    if coop_read_first:
+        parts.append(coop_read_first)
     if warnings:
         parts.append("--- bootstrap warnings ---\n" + "\n".join(warnings))
     if demoted and limit is not None:
@@ -916,6 +952,22 @@ def _assemble(
     return "\n\n".join(parts)
 
 
+_BODY_LAYERS = ("PROJECT_BRIEF.md", "shared core/")
+_SOUL_CORE_LAYER = ("core/",)
+
+
+def _next_demotion(sections: list[str], layers: tuple[str, ...]) -> int | None:
+    """The section to demote next: the last of the first layer that still has one."""
+    for prefix in layers:
+        for index in range(len(sections) - 1, -1, -1):
+            if not _demotable(sections[index]):
+                continue
+            label, _source, _body = _split_section(sections[index])
+            if label.startswith(prefix):
+                return index
+    return None
+
+
 def _fit_host_context(
     agent: str,
     header: str,
@@ -925,38 +977,50 @@ def _fit_host_context(
 ) -> str:
     """Keep the bootstrap inside what the host actually injects.
 
-    Later layers yield first (project overlay, then core notes in reverse
-    load order); each demoted file is named in a read-first block placed
-    before the inline sections so that even a preview still carries the map.
-    The Soul entry, registry, shared boundary, and instructions stay inline.
+    The project overlay yields first, then shared core notes, then the Coop
+    context to a complete read-first file, and the Soul's own core only last
+    (Soul L4: "영혼 자기 core는 늘 통째로 실려"; the terminal reads what the host
+    cannot carry).
+    Each demoted file is named in a read-first block placed before the inline
+    sections so that even a preview still carries the map. The Soul entry,
+    registry, shared boundary, and instructions stay inline.
     """
     limit = _HOST_CONTEXT_MAX_CHARS.get(agent)
     demoted: list[tuple[str, str, int]] = []
+    coop_read_first = ""
+    if len(coop.encode("utf-8")) > _COOP_MAX_BYTES:
+        coop_read_first, coop = _preserve_coop_context(coop, agent), ""
     if limit is None:
-        return _assemble(header, warnings, demoted, sections, coop, limit=None)
+        return _assemble(
+            header, warnings, demoted, sections, coop, limit=None,
+            coop_read_first=coop_read_first,
+        )
     budget = limit - _HOST_CONTEXT_MARGIN_CHARS
     sections = list(sections)
 
     def current() -> str:
-        return _assemble(header, warnings, demoted, sections, coop, limit=limit)
+        return _assemble(
+            header, warnings, demoted, sections, coop, limit=limit,
+            coop_read_first=coop_read_first,
+        )
 
-    while len(current()) > budget:
-        index = next(
-            (i for i in range(len(sections) - 1, -1, -1) if _demotable(sections[i])),
-            None,
-        )
-        if index is None:
-            break
-        label, source, body = _split_section(sections[index])
-        demoted.insert(0, (label, source, len(body)))
-        del sections[index]
-    if len(current()) > budget and coop:
-        excess = len(current()) - budget
-        coop = _clip_chars(
-            coop,
-            max(0, len(coop) - excess),
-            source="`python3 tools/coop/coop.py brief --agent " + agent + "`",
-        )
+    def demote(layers: tuple[str, ...]) -> None:
+        while len(current()) > budget:
+            index = _next_demotion(sections, layers)
+            if index is None:
+                return
+            label, source, body = _split_section(sections[index])
+            demoted.insert(0, (label, source, len(body)))
+            del sections[index]
+
+    demote(_BODY_LAYERS)
+    # A short card costs less than its recovery pointer; keep it inline while
+    # demoting the remaining file-backed identity sections.
+    if len(current()) > budget and len(coop) > 512:
+        coop_read_first, coop = _preserve_coop_context(coop, agent), ""
+    demote(_SOUL_CORE_LAYER)
+    if len(current()) > limit and coop:
+        coop_read_first, coop = _preserve_coop_context(coop, agent), ""
     rendered = current()
     if len(rendered) > limit:
         # Last resort: never hand the host something it will replace with a
@@ -967,6 +1031,7 @@ def _fit_host_context(
 
 
 def render(agent: str, repo_root: Path, *, body: str = "registered-app") -> str:
+    coop, coop_warnings = _coop_brief(repo_root, agent)
     (
         vault,
         configured_soul,
@@ -984,7 +1049,6 @@ def render(agent: str, repo_root: Path, *, body: str = "registered-app") -> str:
         shared_root,
     )
     warnings.extend(identity_warnings)
-    coop, coop_warnings = _coop_brief(repo_root, agent)
     warnings.extend(coop_warnings)
     overlay = ""
     if body == "root":
@@ -1035,17 +1099,13 @@ Forrest still works here with you, but the binder is gone:
         if host_limit is not None
         else ""
     )
+    # A bootstrap catalog (Memory L1): where the identity below came from and
+    # what this host keeps. The isolation and Coop rules live in CLAUDE.md and
+    # the shared boundary, which is inlined below.
     header = f"""<forrest-terminal-context>
 {standing}
 
-- Persistent Soul and Brain are orthogonal; this terminal app is an execution
-  surface, never the identity source.
-- Identity below was read fresh from the selected Soul vault at {vault}.
-- Active identity pointers came from {identity_source}.
-- Coop is the shared work ledger. If its card is unavailable, do not mistake that
-  for an empty inbox; restore access and rerun the brief before project work.
-- Keep WebUI identity injection separate. This terminal bootstrap must never be
-  enabled as a setting source inside Forrest's WebUI SDK turns.
+- Soul vault {vault} (read fresh); identity pointers from {identity_source}.
 - Agent surface: {agent}{host_line}
 """.rstrip()
     sections = list(identity)

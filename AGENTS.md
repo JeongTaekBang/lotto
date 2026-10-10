@@ -18,6 +18,13 @@ pin, bind, or adopt project identity.
 Nothing records that session or returns it to Forrest memory on its own; full
 transcript Adopt stays explicit.
 
+At SessionStart the kit first runs `coop.py letter read --agent <surface>`.
+Addressed handoff bodies are delivered and marked read; start and ack remain
+explicit actions. If the hook names a private temporary file, read it before
+your first reply. Rerunning letter read does not repeat letters already read.
+`COOP LETTERS UNAVAILABLE` means reading was not confirmed; `coop.py show <id>`
+can recover a letter body without changing its state.
+
 Confirm startup output contains `<forrest-terminal-context>`. If it did not
 run, execute the shared bootstrap explicitly:
 
@@ -37,8 +44,9 @@ On the ground-truth host the client needs read/write access to
 means the inbox and WorkUnits were not loaded, not that they are empty.
 Request/allow access and rerun the command before starting project work.
 
-Retrieve relevant history before deep diagnosis, then record a verified unit
-with `coop.py log` and reusable lessons with `coop.py learn`. The generic
+Retrieve relevant history before deep diagnosis. After verification, record
+the unit with `coop.py log` BEFORE the commit; after commit and push, backfill
+with `coop.py sha <entry-id> <sha>`. Record reusable lessons with `coop.py learn`. The generic
 mailbox (`send`, `inbox`, `message-claim`, `reply`, `message-done`) is available
 when another Forrest, Codex, or Claude builder would materially help. Coop is
 logically scoped by this Git root's `lotto` project name and does not replace
