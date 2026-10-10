@@ -472,19 +472,24 @@ def _identity_source() -> tuple[
             os.environ.get("FORREST_WORK_SOUL_PROFILE"),
             expected_soul_id=work_soul_id,
         )
-        shared = os.environ.get("FORREST_WORK_SHARED_INSTRUCTIONS", "").strip()
+        copied = os.environ.get("FORREST_WORK_SHARED_INSTRUCTIONS", "").strip()
         work_warnings: list[str] = []
         if profile is None:
             work_warnings.append(
                 "MANAGED WORKUNIT SOUL ROUTING UNAVAILABLE: registry routing "
                 "projection was not loaded."
             )
-        if not shared:
-            work_warnings.append(
-                "MANAGED WORKUNIT SHARED SOUL INSTRUCTIONS UNAVAILABLE."
-            )
         shared_root = _shared_root(
             os.environ.get("FORREST_WORK_SHARED_VAULT_ROOT"), work_warnings,
+        )
+        shared_path = os.environ.get("FORREST_WORK_SHARED_INSTRUCTIONS_PATH")
+        if shared_path is None and copied:
+            work_warnings.append(
+                "MANAGED WORKUNIT SHARED SOUL INSTRUCTIONS: legacy descriptor "
+                "has no live source path; using its published copy."
+            )
+        shared = _shared_instructions(
+            shared_path, shared_root, copied, work_warnings,
         )
         return root, entry, profile, shared or None, shared_root, source, work_warnings
 
