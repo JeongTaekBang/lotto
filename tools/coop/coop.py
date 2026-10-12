@@ -32,6 +32,9 @@ Ground truth lives on ONE machine (the always-on server) at
 $HOME/forrest-db/coop.db — deliberately outside the Dropbox CloudStorage
 tree (live SQLite + cloud sync don't mix; CLAUDE.md Dropbox caution).
 Satellite machines reach it over SSH; they do not carry their own copy.
+connect() enforces this: on any other machine, the default location
+opens only with an office's owner file or fence (a read-only replica),
+and otherwise raises LedgerUnavailable instead of creating a ledger.
 
 `brief` prints the session-start card without changing any state: which
 machine this is, whether it is the ground-truth server or a satellite, git
@@ -53,6 +56,7 @@ in-process storage API for migration and tests.
 
 Env: COOP_DB_PATH (default $HOME/forrest-db/coop.db, override for tests),
      COOP_GROUND_TRUTH_HOST (default the declared server below),
+     COOP_MACHINE (default the short hostname),
      COOP_AGENT (default agent id; CLAUDECODE=1 implies claude-code).
 """
 
@@ -123,6 +127,10 @@ class LetterNotFound(LookupError):
 
 class LetterTransitionError(ValueError):
     """The letter's state or address does not admit the requested move."""
+
+
+class LedgerUnavailable(RuntimeError):
+    """A satellite reached the default ledger and no office fences it."""
 
 
 @contextmanager
@@ -543,9 +551,31 @@ def owner_path(path=None):
     return Path(str(path or os.environ.get("COOP_DB_PATH") or DEFAULT_DB) + ".owner.json")
 
 
+def _satellite_refusal(db_path):
+    truth = ground_truth_host()
+    return LedgerUnavailable(
+        "COOP LEDGER UNAVAILABLE: %s is a satellite (ground truth: %s) and no "
+        "Coop office fences %s, so this client will not create, read or write "
+        "a local ledger. Run Coop on %s, for example over SSH."
+        % (detect_machine(), truth, db_path, truth)
+    )
+
+
 def connect(path=None, *, _office_writer=False):
     global FTS_OK
     db_path = os.path.abspath(path or os.environ.get("COOP_DB_PATH") or DEFAULT_DB)
+    # The fleet holds fenced, read-only replicas of the one office's ledger
+    # (Memory L10). A client on a satellite that finds neither an owner file
+    # nor a fence at the default location would otherwise start a private
+    # ledger nobody reads; it fails closed instead, like an absent office.
+    satellite = (
+        not _office_writer
+        and detect_machine() != ground_truth_host()
+        and os.path.realpath(db_path) == os.path.realpath(DEFAULT_DB)
+        and not owner_path(db_path).exists()
+    )
+    if satellite and not os.path.exists(db_path):
+        raise _satellite_refusal(db_path)
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = sqlite3.connect(db_path, factory=CoopConnection)
     conn.db_path = db_path
@@ -555,6 +585,9 @@ def connect(path=None, *, _office_writer=False):
         "SELECT 1 FROM sqlite_master WHERE name='coop_office' AND type='table'",
     ).fetchone() is not None
     conn.office_owned = owned
+    if satellite and not owned:
+        conn.close()
+        raise _satellite_refusal(db_path)
     # Every protected row mutation, including a statement prepared before
     # cutover, must resolve this function on THAT connection. Legacy clients
     # have no such function and SQLite rejects their write.
@@ -596,6 +629,10 @@ def connect(path=None, *, _office_writer=False):
 
 def detect_machine():
     return os.environ.get("COOP_MACHINE") or socket.gethostname().split(".")[0]
+
+
+def ground_truth_host():
+    return os.environ.get("COOP_GROUND_TRUTH_HOST", GROUND_TRUTH_HOST)
 
 
 def detect_agent(cli_value=None):
@@ -2368,7 +2405,7 @@ def _print_brief_letters(conn, project, agent):
 def cmd_brief(args):
     try:
         machine = detect_machine()
-        truth = os.environ.get("COOP_GROUND_TRUTH_HOST", GROUND_TRUTH_HOST)
+        truth = ground_truth_host()
         print("━━ coop session brief ━━")
         if machine == truth:
             print("Machine : %s — GROUND-TRUTH server (coop DB + git origin live here)" % machine)
@@ -2439,10 +2476,14 @@ def cmd_brief(args):
         print("Inbox and WorkUnits were NOT loaded; do not treat this as an empty inbox.")
         print("Database: %s" % db_path)
         print("Reason  : %s" % exc)
-        print(
-            "Action  : grant this app read/write access to the database and "
-            "its parent directory, then rerun:"
-        )
+        if isinstance(exc, LedgerUnavailable):
+            print("Action  : run it on %s instead, for example over SSH:"
+                  % ground_truth_host())
+        else:
+            print(
+                "Action  : grant this app read/write access to the database and "
+                "its parent directory, then rerun:"
+            )
         print("          " + retry)
         print("Do not start project work until the retry prints the normal Coop brief.")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -2825,5 +2866,5 @@ for _name in WRITE_METHODS:
 if __name__ == "__main__":
     try:
         main()
-    except OfficeCallError as exc:
+    except (OfficeCallError, LedgerUnavailable) as exc:
         sys.exit(str(exc))
