@@ -15,23 +15,27 @@
     "context_key": "app:lotto"
   },
   "integration": {
-    "bundle_version": 29,
+    "bundle_version": 31,
     "scaffold_version": 1,
     "managed_hashes": {
       ".claude/settings.json": "1b9b3ad9048fb540adae1acde0feefc0eb7bd6e500eeee7fd43a4e933d2a4cc6",
       ".codex/hooks.json": "47dd8289a5c6436d1e90632377cb4ed604918ab0e7a74aa9c67109f79f84c305",
-      ".forrest/session_start.py": "55c961b19ac733a64a017401be43ee89e7178d0d38b7f31f576b8d7ac573b0f8",
-      "AGENTS.md": "db7778d4d07b4c365b18893066b7d0684913ed3ecd57b87624377be2377493f0",
+      ".forrest/session_start.py": "158341b1850843aea6de265d8807f241d683d8fe8776d8bb8039457ac43815f6",
+      "AGENTS.md": "c992f7be0138390d39f40cd4f73a458bc97f4566a3c487e2d8ba5c3da4eebb3c",
       "CLAUDE.md": "4641fe2446dbff0b63136798b5835a2610de0e3a83133ae4dda8392d22fcbd69",
-      "tools/coop/coop.py": "f6f1ecb0978272c42a0f6e2b171a67cac4977d0e6e40b4c1c51582e9601d7f5f"
+      "tools/coop/coop.py": "9a5efa110005bd04e1f9ce99ee235617a015fd4c0fbcaee502931804c9f7ec51",
+      "tools/coop/family-ledger.json": "d8b103e1763ce5b46ec4e42ca1276117c1e01ef5620b67d0a4c4a6f84783c1ef",
+      "tools/coop/manifest.json": "18b98442d86c5b807ba2a16a28be2811969b08e3bfa617fce6da779f954a7ac8"
     },
     "guard_hashes": {
       ".claude/settings.json": "68d83509b28d1832272e789f69c2099c1105f5d0a68afa2cd82643bbe59cfc75",
       ".codex/hooks.json": "0491effc14e6dd6b7d2a6a59876b5e3d7b6c8b00c237aa641d7cca4640a5cf68",
-      ".forrest/session_start.py": "55c961b19ac733a64a017401be43ee89e7178d0d38b7f31f576b8d7ac573b0f8",
-      "AGENTS.md": "49fb43d6b39727de91b9d8d8f5515ef0f8c935f20f40390ae473dcf2acfb99b3",
+      ".forrest/session_start.py": "158341b1850843aea6de265d8807f241d683d8fe8776d8bb8039457ac43815f6",
+      "AGENTS.md": "f5d97f9271113902d7cee0778669a3b58d7d32f29075182ab5424fcafebefeeb",
       "CLAUDE.md": "0227535bcdc951a736393b1cbd0a141ad33aa2d2eba421f941e2f00dabc77265",
-      "tools/coop/coop.py": "f6f1ecb0978272c42a0f6e2b171a67cac4977d0e6e40b4c1c51582e9601d7f5f"
+      "tools/coop/coop.py": "9a5efa110005bd04e1f9ce99ee235617a015fd4c0fbcaee502931804c9f7ec51",
+      "tools/coop/family-ledger.json": "d8b103e1763ce5b46ec4e42ca1276117c1e01ef5620b67d0a4c4a6f84783c1ef",
+      "tools/coop/manifest.json": "18b98442d86c5b807ba2a16a28be2811969b08e3bfa617fce6da779f954a7ac8"
     },
     "scaffold_hashes": {
       "PROJECT_BRIEF.md": "cc7b996cecf6b7377b5459f9477fd85cb25f3d02d05c7eee48381fac16da28c4"

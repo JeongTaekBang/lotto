@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "roles": {
+    "forrest": "Jeongtaeks-Mac-Studio",
+    "workbench": "Jeongtaeks-Mac-Studio"
+  },
+  "machines": {
+    "Jeongtaeks-Mac-Studio": {
+      "hostnames": [
+        "Jeongtaeks-Mac-Studio",
+        "Jeongtaeks-Mac-Studio.local"
+      ],
+      "fleet_label": "Jeongtaeks-Mac-Studio",
+      "magic_dns": "jeongtaeks-mac-studio.tail74d4a0.ts.net"
+    }
+  },
+  "members": {
+    "forrest": {
+      "host": "@forrest",
+      "port": 8976,
+      "https_twin": true,
+      "web_port": 5174,
+      "browser_client": true
+    },
+    "workbench_web": {
+      "host": "@workbench",
+      "port": 5174,
+      "browser_client": true
+    },
+    "coop": {
+      "host": "@forrest",
+      "port": 8978,
+      "loopback_only": true,
+      "compat_path": "/api/coop/compat",
+      "https_port": 443
+    },
+    "ollama": {
+      "host": "@forrest",
+      "port": 11434,
+      "loopback_only": true,
+      "origin_env": "OLLAMA_BASE_URL"
+    },
+    "omlx": {
+      "host": "@forrest",
+      "port": 8979,
+      "loopback_only": true,
+      "origin_env": "FORREST_OMLX_BASE_URL"
+    }
+  }
+}

@@ -49,8 +49,20 @@ _HOOK_PAYLOAD_MAX_BYTES = 1024 * 1024
 # a 2,000-character preview reaches the model (observed on Claude Code 2.1.270,
 # 2026-09-14; tracked upstream as anthropics/claude-code#44086). Codex hooks run
 # with additionalContextLimit=0 and keep the full bootstrap.
+# Claude Code caps a hook's plain stdout at 10,000 characters; over the cap the
+# model gets the file path plus a preview of the first 2,000 characters
+# (code.claude.com/docs/en/hooks, "Over the limit"). The cap counts
+# characters, not bytes: on 2026-10-31 an 8,614-character, 15,507-byte
+# bootstrap rode whole (that session's hook_success attachment). The host is
+# JavaScript, so `_host_chars` counts UTF-16 units like its `.length`; the
+# margin covers only the unknown >/>= boundary and the host's own wrapper.
 _HOST_CONTEXT_MAX_CHARS = {"claude-code": 10_000}
-_HOST_CONTEXT_MARGIN_CHARS = 1_000
+_HOST_CONTEXT_MARGIN_CHARS = 200
+
+
+def _host_chars(text: str) -> int:
+    """The host's count of ``text``: UTF-16 code units, as JavaScript's ``.length``."""
+    return len(text.encode("utf-16-le")) // 2
 _DEMOTABLE_LABEL_PREFIXES = ("core/", "shared core/", "PROJECT_BRIEF.md")
 _FORREST_PROTOCOL_BEGIN = "<!-- BEGIN:forrest-project-protocol -->"
 _FORREST_PROTOCOL_END = "<!-- END:forrest-project-protocol -->"
@@ -277,7 +289,11 @@ def verify_integration(repo_root: Path) -> list[str]:
         guards = integration.get("guard_hashes") if isinstance(integration, dict) else None
         binding = manifest.get("context_binding") if isinstance(manifest, dict) else None
         slug = manifest.get("slug") if isinstance(manifest, dict) else None
-        if not isinstance(guards, dict) or set(guards) != set(_GUARDED_PATHS):
+        guarded_paths = _GUARDED_PATHS
+        version = integration.get("bundle_version") if isinstance(integration, dict) else None
+        if type(version) is int and version >= 30:
+            guarded_paths += ("tools/coop/family-ledger.json", "tools/coop/manifest.json")
+        if not isinstance(guards, dict) or set(guards) != set(guarded_paths):
             raise ValueError("manifest guard_hashes are unavailable or incomplete")
         if (
             not isinstance(binding, dict)
@@ -296,7 +312,7 @@ def verify_integration(repo_root: Path) -> list[str]:
         return [f"{manifest_path}: {exc}"]
 
     failures: list[str] = []
-    for relative in _GUARDED_PATHS:
+    for relative in guarded_paths:
         path = repo_root / relative
         try:
             content = path.read_bytes()
@@ -917,19 +933,13 @@ def _demotable(section: str) -> bool:
     )
 
 
-def _read_first_block(demoted: list[tuple[str, str, int]], limit: int) -> str:
+def _read_first_block(demoted: list[tuple[str, str, int]]) -> str:
     lines = [
         "--- always-on self not inlined (host limit) ---",
-        f"Claude Code keeps at most {limit:,} characters of SessionStart output, so",
-        "these always-on files did not fit.",
         "Read each one with the Read tool before your first reply, in this order:",
     ]
     for index, (label, source, chars) in enumerate(demoted, start=1):
         lines.append(f"{index}. {source} — {label} ({chars:,} chars)")
-    lines.append(
-        "index/, playbook/, memory/, and library/ stay on demand as "
-        "instructions.md directs."
-    )
     return "\n".join(lines)
 
 
@@ -949,7 +959,7 @@ def _assemble(
     if warnings:
         parts.append("--- bootstrap warnings ---\n" + "\n".join(warnings))
     if demoted and limit is not None:
-        parts.append(_read_first_block(demoted, limit))
+        parts.append(_read_first_block(demoted))
     parts.extend(sections)
     if coop:
         parts.append(coop)
@@ -1010,7 +1020,7 @@ def _fit_host_context(
         )
 
     def demote(layers: tuple[str, ...]) -> None:
-        while len(current()) > budget:
+        while _host_chars(current()) > budget:
             index = _next_demotion(sections, layers)
             if index is None:
                 return
@@ -1021,13 +1031,13 @@ def _fit_host_context(
     demote(_BODY_LAYERS)
     # A short card costs less than its recovery pointer; keep it inline while
     # demoting the remaining file-backed identity sections.
-    if len(current()) > budget and len(coop) > 512:
+    if _host_chars(current()) > budget and len(coop) > 512:
         coop_read_first, coop = _preserve_coop_context(coop, agent), ""
     demote(_SOUL_CORE_LAYER)
-    if len(current()) > limit and coop:
+    if _host_chars(current()) > limit and coop:
         coop_read_first, coop = _preserve_coop_context(coop, agent), ""
     rendered = current()
-    if len(rendered) > limit:
+    if _host_chars(rendered) > limit:
         # Last resort: never hand the host something it will replace with a
         # preview. The cut is visible and names where the rest lives.
         closer = "\n\n[bounded at the host limit; read instructions.md and core/ from the vault]\n\n</forrest-terminal-context>"

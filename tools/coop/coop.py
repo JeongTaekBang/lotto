@@ -14,8 +14,10 @@ plus abandoned / superseded. `note` writes one (optionally `--to` an agent;
 without a recipient it is for any future session of the project). The
 session ritual is `letter read` (the only command that marks letters read),
 `letter start <id>` when acting on one, `letter ack <id> --body …` when it
-shipped. Unregistered sessions keep these explicit transitions. Memory L10's
-office engine separately tracks obligations for explicitly assigned sessions.
+shipped. A take from a terminal (`take`, `message-claim`) is a take the
+office records: an observed session that owes an outcome within three hours,
+discharged by the taker's own `done`/`release`/`abandon` (Coop Quest
+"adopting-a-take", "an-outcome-is-owed").
 
 Learnings are history's typed sister table (schema v4, Memory L6
 `learning_entries`): history asks what a session did, a learning what a
@@ -28,10 +30,21 @@ Agents may also address generic mailbox messages to one another.  Coop owns
 delivery, threads, artifact references and claim state; the agents own the
 judgment about whether, when and how to collaborate.
 
+Schema v5 (Coop Quest track 1, 2026-11-06) gives todos the lesson's
+lifecycle — ``open → taken → done | abandoned``, ``release`` back to open, the
+``open → done`` fast path, the taker and closer on the row, the first close as
+the record (`take`, `release`, `done`, `abandon`) — records every todo, letter
+and message transition in the append-only ``coop_events`` table (`events`),
+lets a learning be superseded (`learn --supersedes`), keeps history
+``(project, slug)`` unique, counts a letter's reads, keeps one live letter per
+author and address, refuses a letter that points at a handoff file, and
+checks every stored identity against the roster (CANONICAL_AGENT_IDS).
+
 Ground truth lives on ONE machine (the always-on server) at
 $HOME/forrest-db/coop.db — deliberately outside the Dropbox CloudStorage
 tree (live SQLite + cloud sync don't mix; CLAUDE.md Dropbox caution).
-Satellite machines reach it over SSH; they do not carry their own copy.
+Satellite writers use the registered HTTPS compatibility gateway; fenced
+local replicas remain read-only. There is no persistent SSH write tunnel.
 connect() enforces this: on any other machine, the default location
 opens only with an office's owner file or fence (a read-only replica),
 and otherwise raises LedgerUnavailable instead of creating a ledger.
@@ -55,7 +68,7 @@ cannot acknowledge them. Isolated, unadopted ledgers retain the original
 in-process storage API for migration and tests.
 
 Env: COOP_DB_PATH (default $HOME/forrest-db/coop.db, override for tests),
-     COOP_GROUND_TRUTH_HOST (default the declared server below),
+     COOP_GROUND_TRUTH_HOST (explicit override; otherwise the live Forrest role),
      COOP_MACHINE (default the short hostname),
      COOP_AGENT (default agent id; CLAUDECODE=1 implies claude-code).
 """
@@ -73,11 +86,11 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from urllib import error as urlerror, request as urlrequest
 
-GROUND_TRUTH_HOST = "Jeongtaeks-Mac-Studio"  # BJT's Mac Studio — the always-on server
 DEFAULT_DB = os.path.join(os.path.expanduser("~"), "forrest-db", "coop.db")
 # The CLI/filter vocabulary. ``note`` stays a word people and docs use, but
 # since schema v3 a note is a row in ``letters``; ``entries`` keeps only the
@@ -92,18 +105,29 @@ ENTRY_KINDS = ("history", "learning", "todo")
 LEARNING_TEXT_FIELDS = (
     "scope", "slug", "problem", "hypothesis", "resolution", "source",
 )
-# Todo statuses (``done``/``status`` commands, /api/coop/entries/{id}/status).
-STATUSES = ("open", "read", "done", "superseded")
+# Todo statuses. The lifecycle is Coop Quest "lifecycles-and-the-first-close":
+# ``open → taken → done | abandoned``, ``release`` back to open, and the fast
+# path ``open → done``. ``read`` and ``superseded`` are legacy values written
+# before schema v5: still readable, listable and filterable, never written
+# again (``read`` is taken like ``open``; ``superseded`` is terminal).
+STATUSES = ("open", "taken", "done", "abandoned", "read", "superseded")
+TODO_OPEN_STATUSES = ("open", "read")
+TODO_ACTIVE_STATUSES = ("open", "taken", "read")
+TODO_TERMINAL_STATUSES = ("done", "abandoned", "superseded")
+TODO_LEGACY_STATUSES = ("read", "superseded")
 LETTER_STATUSES = (
     "unread", "read", "working", "done", "abandoned", "superseded",
 )
 ACTIVE_LETTER_STATUSES = ("unread", "read", "working")
 # action -> (statuses it may leave, status it enters). Anything else is an
-# illegal transition and is refused, never coerced.
+# illegal transition and is refused, never coerced. ``ack`` closes from
+# ``read`` or ``working`` ("skipping working is fine", Coop Quest
+# "a-letter-carries-itself"); a later ``read`` of a live letter is no
+# transition but bumps ``read_count`` (transition_letter, read_letters).
 LETTER_TRANSITIONS = {
     "read": (("unread",), "read"),
     "start": (("read",), "working"),
-    "ack": (("working",), "done"),
+    "ack": (("read", "working"), "done"),
     "abandon": (ACTIVE_LETTER_STATUSES, "abandoned"),
     "supersede": (ACTIVE_LETTER_STATUSES, "superseded"),
 }
@@ -113,8 +137,45 @@ REVIEW_STATUSES = (
 REVIEW_VERDICTS = ("approved", "changes_requested")
 MESSAGE_STATUSES = ("open", "claimed", "done", "superseded")
 ACTIVE_MESSAGE_STATUSES = ("open", "claimed")
-COOP_SCHEMA_VERSION = 4
+# The intents a writer may put on a message. Each is read by some code:
+# dispatch threads and `coop.py send`/`reply` use request/response, the
+# legacy review projection peer_review/review_feedback, project work its
+# three modes plus work_result/work_revision. Coop Quest
+# "seven-tables-and-a-roster" dropped a column no reader processed ("a field
+# nobody processes is not neutral"); here the readers exist, so the set is
+# closed at write time instead, and old rows keep whatever they say.
+MESSAGE_INTENTS = (
+    "request", "response", "peer_review", "review_feedback", "work_result",
+    "work_revision", "project_implement", "project_review", "project_refine",
+)
+# The roster (Coop Quest "seven-tables-and-a-roster"): one id per surface,
+# checked by require_canonical_identity at every write that stores an
+# identity; reads stay lenient so older spellings still list and filter.
+# ``dad`` is BJT at a keyboard (the engine already reserves it: a model
+# cannot act as Dad); the two terminal surfaces carry their product names;
+# the WebUI Brains are ``<brain>-forrest``; ``forrest`` is the app's own
+# door (coop_runtime.APP_AGENT_ID). A new surface joins this tuple first.
+CANONICAL_AGENT_IDS = (
+    "dad",
+    "claude-code", "codex",
+    "claude-forrest", "opus-forrest", "fable-forrest", "codex-forrest",
+    "ollama-forrest",
+    "forrest",
+)
+# The six handoff-document stems the letter checkpoint knows (Coop Quest
+# "a-letter-carries-itself"): a path-shaped mention is refused, a bare name
+# passes.
+HANDOFF_STEMS = (
+    "handoff", "handover", "session-notes", "session-state",
+    "new-session-reminder", "context-dump",
+)
+COOP_SCHEMA_VERSION = 5
 BRIEF_ITEM_LIMIT = 10
+# Settled client receipt files (committed / rejected) are deleted after a
+# day, checked at most hourly; uncertain ones stay until reconciled (Coop
+# Quest "the-owner-file-fails-closed").
+RECEIPT_RETENTION_SECONDS = 86400
+RECEIPT_PRUNE_INTERVAL_SECONDS = 3600
 
 # ---------------------------------------------------------------- storage
 
@@ -131,6 +192,19 @@ class LetterTransitionError(ValueError):
 
 class LedgerUnavailable(RuntimeError):
     """A satellite reached the default ledger and no office fences it."""
+
+
+class LifecycleError(ValueError):
+    """A todo move the lifecycle does not admit: wrong state, wrong actor,
+    or the row changed under the write."""
+
+
+class UnknownIdentityError(ValueError):
+    """A write tried to store an identity the roster does not name."""
+
+
+class HandoffPointerError(ValueError):
+    """A letter body points at a handoff file instead of carrying the handoff."""
 
 
 @contextmanager
@@ -309,8 +383,34 @@ CREATE TABLE IF NOT EXISTS learning_entries (
 )
 """
 
+# Created by the v5 migration (Coop Quest "seven-tables-and-a-roster":
+# "coop_events — one status change of a todo, request or letter; append
+# only, never deleted"). The two guard triggers make the table append-only
+# at the schema: no UPDATE or DELETE succeeds, for any writer.
+_COOP_EVENTS_TABLE = """
+CREATE TABLE IF NOT EXISTS coop_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  entry_id INTEGER NOT NULL,
+  event TEXT NOT NULL,
+  from_status TEXT NOT NULL DEFAULT '',
+  to_status TEXT NOT NULL DEFAULT '',
+  actor TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  payload TEXT NOT NULL DEFAULT '{}',
+  at TEXT NOT NULL
+)
+"""
+_COOP_EVENTS_GUARDS = (
+    "CREATE TRIGGER IF NOT EXISTS coop_events_no_update BEFORE UPDATE ON coop_events"
+    " BEGIN SELECT RAISE(ABORT, 'coop_events is append-only'); END",
+    "CREATE TRIGGER IF NOT EXISTS coop_events_no_delete BEFORE DELETE ON coop_events"
+    " BEGIN SELECT RAISE(ABORT, 'coop_events is append-only'); END",
+)
+
 _INDEX_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_entries_kind_created ON entries(kind, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_coop_events_entry ON coop_events(kind, entry_id, id);
 CREATE INDEX IF NOT EXISTS idx_entries_project ON entries(project);
 CREATE INDEX IF NOT EXISTS idx_messages_recipient_status
   ON messages(recipient_agent, status, created_at DESC);
@@ -492,10 +592,107 @@ def _migrate_schema(conn):
             # without FTS5 still migrates and searches with LIKE.
             conn.execute(_LEARNING_ENTRIES_TABLE)
             conn.execute("PRAGMA user_version=4")
+        if current < 5:
+            # Coop Quest track 1 (2026-11-06): a todo keeps its taker and
+            # closer, every transition is an append-only coop_events row, a
+            # learning can be superseded, a letter counts its reads, and
+            # history (project, slug) is unique. Every column is additive
+            # with a default; the only rewrite is the slug of a later
+            # duplicate history row, each with an `edit` event carrying the
+            # previous slug (_dedupe_history_slugs). A v4 client ignores the
+            # columns, so a rollback is `PRAGMA user_version=4`.
+            for column, ddl in (
+                ("taken_by", "TEXT NOT NULL DEFAULT ''"),
+                ("taken_at", "TEXT NOT NULL DEFAULT ''"),
+                ("closed_by", "TEXT NOT NULL DEFAULT ''"),
+                ("closed_at", "TEXT NOT NULL DEFAULT ''"),
+                ("result_summary", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column not in _table_columns(conn, "entries"):
+                    conn.execute(
+                        "ALTER TABLE entries ADD COLUMN %s %s" % (column, ddl),
+                    )
+            for column, ddl in (
+                ("read_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("last_read_at", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column not in _table_columns(conn, "letters"):
+                    conn.execute(
+                        "ALTER TABLE letters ADD COLUMN %s %s" % (column, ddl),
+                    )
+            # A letter past unread was read at least once; the exact time is
+            # known only while it is still `read` (its last update).
+            conn.execute(
+                "UPDATE letters SET read_count=1 WHERE read_count=0"
+                " AND status IN ('read','working','done')"
+            )
+            conn.execute(
+                "UPDATE letters SET last_read_at=updated_at"
+                " WHERE last_read_at='' AND status='read'"
+            )
+            if "superseded_by" not in _table_columns(conn, "learning_entries"):
+                conn.execute(
+                    "ALTER TABLE learning_entries ADD COLUMN superseded_by"
+                    " INTEGER REFERENCES learning_entries(id)"
+                )
+            conn.execute(_COOP_EVENTS_TABLE)
+            for statement in _COOP_EVENTS_GUARDS:
+                conn.execute(statement)
+            _dedupe_history_slugs(conn)
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_history_slug"
+                " ON entries(project, slug) WHERE kind='history'"
+            )
+            conn.execute("PRAGMA user_version=5")
         conn.commit()
     except Exception:
         conn.rollback()
         raise
+
+
+def _dedupe_history_slugs(conn):
+    """Make every later duplicate of a history (project, slug) unique.
+
+    Coop Quest "seven-tables-and-a-roster": history_entries' (scope, slug)
+    must be unique. The first row of a group keeps its slug (get_entry_by_slug
+    already answered with it: the lowest id); each later one gets `-2`,
+    `-3`, … and an `edit` event in coop_events carrying the previous slug,
+    so the rename is history, not an overwrite. Runs inside the v5
+    migration's transaction. Live ledger on 2026-11-06: five groups, ten
+    rows renamed.
+    """
+    groups = conn.execute(
+        "SELECT project, slug FROM entries WHERE kind='history'"
+        " GROUP BY project, slug HAVING COUNT(*) > 1 ORDER BY project, slug",
+    ).fetchall()
+    for group in groups:
+        rows = conn.execute(
+            "SELECT id, slug FROM entries WHERE kind='history'"
+            " AND project=? AND slug=? ORDER BY id",
+            (group["project"], group["slug"]),
+        ).fetchall()
+        taken = {
+            row[0] for row in conn.execute(
+                "SELECT slug FROM entries WHERE kind='history' AND project=?",
+                (group["project"],),
+            )
+        }
+        suffix = 2
+        for row in rows[1:]:
+            while True:
+                candidate = "%s-%d" % (row["slug"], suffix)
+                suffix += 1
+                if candidate not in taken:
+                    break
+            taken.add(candidate)
+            conn.execute(
+                "UPDATE entries SET slug=? WHERE id=?", (candidate, row["id"]),
+            )
+            _record_event(
+                conn, "history", row["id"], "edit", "migration",
+                reason="history (project, slug) made unique at coop schema v5",
+                payload={"fields": ["slug"], "previous": {"slug": row["slug"]}},
+            )
 
 
 def _ensure_fts_index(conn, table, statements):
@@ -556,7 +753,7 @@ def _satellite_refusal(db_path):
     return LedgerUnavailable(
         "COOP LEDGER UNAVAILABLE: %s is a satellite (ground truth: %s) and no "
         "Coop office fences %s, so this client will not create, read or write "
-        "a local ledger. Run Coop on %s, for example over SSH."
+        "a local ledger. Restore a fenced replica or run Coop on %s."
         % (detect_machine(), truth, db_path, truth)
     )
 
@@ -564,13 +761,16 @@ def _satellite_refusal(db_path):
 def connect(path=None, *, _office_writer=False):
     global FTS_OK
     db_path = os.path.abspath(path or os.environ.get("COOP_DB_PATH") or DEFAULT_DB)
+    canonical = os.path.realpath(db_path) == os.path.realpath(DEFAULT_DB)
+    if _office_writer and canonical and not is_local_office_owner():
+        raise _satellite_refusal(db_path)
     # The fleet holds fenced, read-only replicas of the one office's ledger
     # (Memory L10). A client on a satellite that finds neither an owner file
     # nor a fence at the default location would otherwise start a private
     # ledger nobody reads; it fails closed instead, like an absent office.
     satellite = (
         not _office_writer
-        and detect_machine() != ground_truth_host()
+        and not is_local_office_owner()
         and os.path.realpath(db_path) == os.path.realpath(DEFAULT_DB)
         and not owner_path(db_path).exists()
     )
@@ -591,7 +791,8 @@ def connect(path=None, *, _office_writer=False):
     # Every protected row mutation, including a statement prepared before
     # cutover, must resolve this function on THAT connection. Legacy clients
     # have no such function and SQLite rejects their write.
-    conn.create_function("coop_writer_authorized", 0, lambda: int(conn.office_writer))
+    conn.create_function("coop_writer_authorized", 0,
+        lambda: int(conn.office_writer and (not canonical or is_local_office_owner())))
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
     if owned and not _office_writer:
@@ -631,8 +832,111 @@ def detect_machine():
     return os.environ.get("COOP_MACHINE") or socket.gethostname().split(".")[0]
 
 
+def _family_ledger():
+    """Read one canonical role declaration; the export is only its fallback."""
+    explicit = os.environ.get("FORREST_FAMILY_LEDGER", "").strip()
+    live = Path(explicit).expanduser() if explicit else Path.home() / "bjtPersonalProjects/bjtForrest/config/family-ledger.json"
+    for path in (live, Path(__file__).with_name("family-ledger.json")):
+        try:
+            value = json.loads(path.read_text())
+            roles, machines = value["roles"], value["machines"]
+            if (type(value.get("schema_version")) is int and value["schema_version"] == 1
+                    and isinstance(roles, dict) and set(roles) == {"forrest", "workbench"}
+                    and isinstance(machines, dict)
+                    and all(isinstance(role, str) and role in machines for role in roles.values())
+                    and all(isinstance(machine, dict) and isinstance(machine.get("hostnames"), list)
+                        and machine["hostnames"] and all(isinstance(name, str) and name for name in machine["hostnames"])
+                        for machine in machines.values())):
+                return value
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    raise LedgerUnavailable("Coop cannot resolve the canonical Forrest role")
+
+
 def ground_truth_host():
-    return os.environ.get("COOP_GROUND_TRUTH_HOST", GROUND_TRUTH_HOST)
+    override = os.environ.get("COOP_GROUND_TRUTH_HOST", "").strip()
+    return override or _family_ledger()["roles"]["forrest"]
+
+
+def is_ground_truth_machine():
+    if os.environ.get("COOP_GROUND_TRUTH_HOST", "").strip():
+        return detect_machine().casefold().rstrip(".") == ground_truth_host().casefold().rstrip(".")
+    family = _family_ledger()
+    role = family["roles"]["forrest"]
+    names = {role, *family["machines"][role].get("hostnames", [])}
+    return detect_machine().casefold().rstrip(".") in {name.casefold().rstrip(".") for name in names}
+
+
+
+def ark_profile():
+    """A local independent fork; canonical role ownership remains unchanged."""
+    family = _family_ledger()
+    machine = detect_machine().casefold().rstrip('.')
+    matches = [name for name, row in family['machines'].items()
+               if machine in {value.casefold().rstrip('.') for value in [name, *row.get('hostnames', [])]}]
+    if len(matches) != 1 or matches[0] == family['roles']['forrest']:
+        return None
+    path = Path(os.environ.get('FORREST_HOST_PROFILE', Path.home()/'.config/forrest/host-profile.json')).expanduser()
+    try:
+        value = json.loads(path.read_text())
+    except FileNotFoundError:
+        if os.environ.get('FORREST_ARK_BRANCH'):
+            raise LedgerUnavailable('running Ark lost its branch profile') from None
+        return None
+    except (OSError, ValueError):
+        raise LedgerUnavailable('local host profile is unreadable') from None
+    if not isinstance(value, dict):
+        raise LedgerUnavailable('local host profile is invalid')
+    if value.get('ark') is not True:
+        if os.environ.get('FORREST_ARK_BRANCH'):
+            raise LedgerUnavailable('running Ark lost its branch authority')
+        return None
+    if (value.get('version') != 1
+            or value.get('machine') != matches[0] or not isinstance(value.get('branch_id'), str)
+            or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{7,127}', value['branch_id'])
+            or not isinstance(value.get('members', {}), dict) or not isinstance(value.get('writers', {}), dict)
+            or os.environ.get('FORREST_ARK_BRANCH', value['branch_id']) != value['branch_id']):
+        raise LedgerUnavailable('local Ark profile does not own this branch')
+    return value
+
+
+def is_local_office_owner():
+    profile = ark_profile()
+    return is_ground_truth_machine() or bool(profile and profile.get('members', {}).get('coop') == 'run')
+
+
+def require_family_writer(db_path, *, outward=False, now=None, writer="coop-native"):
+    """An Ark owns only its local fork; outward copied work defaults held."""
+    profile = ark_profile()
+    if profile:
+        if profile.get('members', {}).get('coop') != 'run':
+            raise LedgerUnavailable('Ark Coop member is held')
+        if outward and profile.get('writers', {}).get(writer) != 'run':
+            raise LedgerUnavailable('Ark outward writer is held: ' + writer)
+        return
+    if os.path.realpath(db_path) != os.path.realpath(DEFAULT_DB):
+        return  # Separate ledgers/tests are not replicas of the canonical DB.
+    if not is_ground_truth_machine():
+        raise _satellite_refusal(db_path)
+    if not outward:
+        return
+    family = _family_ledger()
+    if family['roles'].get('forrest') == family['roles'].get('workbench'):
+        return
+    path = Path(os.environ.get('FORREST_LEDGER_CONFIRMATION', Path.home()/'.cache/forrest/ledger-confirm.json')).expanduser()
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        return  # An unenrolled current installation keeps its existing behavior.
+    except (OSError, ValueError):
+        raise LedgerUnavailable('Coop notifier holds: origin confirmation unreadable') from None
+    try:
+        stamp=dt.datetime.fromisoformat(raw['confirmed_at'].replace('Z','+00:00'))
+        age=((now or dt.datetime.now(dt.timezone.utc))-stamp).total_seconds()
+        if stamp.tzinfo is None or not 0 <= age <= 1800:
+            raise ValueError('expired')
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise LedgerUnavailable('Coop notifier holds: no valid origin confirmation within 30 minutes') from None
 
 
 def detect_agent(cli_value=None):
@@ -678,6 +982,97 @@ def detect_project(cli_value=None, cwd=None):
     return os.path.basename(cwd or os.getcwd())
 
 
+# ---------------------------------------------------------------- a take's origin
+# Coop Quest "adopting-a-take": a CLI call declares the chat it runs in and
+# the Mac it ran on, so the engine records a terminal take against that chat
+# "without asking the model to remember anything". An exported reference
+# always wins over detection. Claude Code registers every live chat as
+# `~/.claude/sessions/<pid>.json` (with its `sessionId`), and a CLI call typed
+# in that chat is a descendant of that process, so the parent chain is walked
+# up to MAX_ANCESTORS levels; Codex has no per-process registry and exports
+# `codex:<thread id>` itself.
+
+SESSION_ENV = "FORREST_COOP_SESSION"
+HOST_ENV = "FORREST_COOP_HOST"
+MAX_ANCESTORS = 16
+
+
+def _parent(pid):
+    """The parent pid through `ps -o ppid=`, or None when it cannot be read."""
+    try:
+        out = subprocess.run(
+            ["/bin/ps", "-o", "ppid=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return int(out) if out.isdigit() else None
+
+
+def detect_claude_session(registry=None, pid=None, parent=None):
+    """`claude:<sessionId>` of the Claude Code chat this process runs in, else None.
+
+    Coop Quest "adopting-a-take": "`detect_claude_session`은 `ps -o ppid=`로
+    부모 사슬을 거슬러 올라가. 최대 열여섯 단계, 등록 파일이 있는 pid를 만날
+    때까지. 그리고 `claude:<sessionId>`를 돌려줘. 훅도, 플래그도, 프롬프트 속
+    지시도 없어." ``registry`` and ``parent`` are injectable so a test walks
+    a fake process tree against a fake registry; the walk stops at pid 1.
+    """
+    registry = Path(registry) if registry else Path.home() / ".claude" / "sessions"
+    if not registry.is_dir():
+        return None
+    parent = parent or _parent
+    pid = os.getpid() if pid is None else pid
+    for _ in range(MAX_ANCESTORS):
+        entry = registry / ("%d.json" % pid)
+        if entry.is_file():
+            try:
+                session = json.loads(entry.read_text()).get("sessionId")
+            except (OSError, ValueError, AttributeError):
+                return None
+            return "claude:" + session if isinstance(session, str) and session else None
+        pid = parent(pid)
+        if not pid or pid <= 1:
+            return None
+    return None
+
+
+def detect_session():
+    """The chat reference a take declares: the exported one, else the detected one."""
+    exported = os.environ.get(SESSION_ENV, "").strip()
+    return exported or detect_claude_session() or ""
+
+
+def fleet_label(machine=None):
+    """This Mac's fleet label from the family ledger, else its own short name."""
+    own = machine or detect_machine()
+    name = own.casefold().rstrip(".")
+    try:
+        family = _family_ledger()
+    except LedgerUnavailable:
+        return own
+    for label, row in family.get("machines", {}).items():
+        names = {label, *row.get("hostnames", [])}
+        if name in {value.casefold().rstrip(".") for value in names}:
+            return row.get("fleet_label") or label
+    return own
+
+
+def declared_host():
+    """The Mac the command ran on: `FORREST_COOP_HOST`, else the fleet label.
+
+    Coop Quest "adopting-a-take": "ssh로 들어가서 쳤다면, 밝히는 건 호출한 쪽
+    맥이 아니라 명령이 떨어진 맥이야."
+    """
+    return os.environ.get(HOST_ENV, "").strip() or fleet_label()
+
+
+def declare_origin():
+    """What a take declares about itself; `_office_writer` fills it on the way
+    to the office: the chat reference (or ''), the Mac and the working directory."""
+    return {"session": detect_session(), "host": declared_host(), "workspace": os.getcwd()}
+
+
 def now_iso():
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -691,6 +1086,126 @@ def read_body(value):
     if value == "-":
         return sys.stdin.read().strip()
     return value or ""
+
+
+def _field(row, name, default=""):
+    """A column a ledger older than this client may not carry yet."""
+    return row[name] if name in row.keys() else default
+
+
+# ---------------------------------------------------------------- checkpoints
+# Coop Quest "seven-tables-and-a-roster" and "a-letter-carries-itself": a
+# rule the schema cannot check lives in the helper every write passes
+# through, refuses before anything is written, and carries the fix.
+
+
+def require_canonical_identity(value, *, role="actor"):
+    """Refuse to store ``value`` as an identity unless the roster names it.
+
+    Coop Quest "seven-tables-and-a-roster": identity columns are plain TEXT,
+    so the roster is checked at the write gate, in the helpers every write
+    passes through; reads stay lenient so every old spelling still lists.
+    ``role`` names the field the value would fill (actor, assignee,
+    recipient). The refusal carries the fix — the field, the roster and the
+    derivation rule — so the next correct call is in the message.
+    """
+    text = value.strip() if isinstance(value, str) else value
+    if text in CANONICAL_AGENT_IDS:
+        return text
+    hint = ""
+    if text in ("human", "unknown", "", None):
+        hint = (
+            "\n  this session has no identity: pass --agent <id> or set"
+            " COOP_AGENT=<id> (Claude Code sets claude-code itself; BJT at a"
+            " keyboard is dad)"
+        )
+    elif text == "any":
+        hint = (
+            "\n  'any' is not an identity: a todo for anyone has no assignee,"
+            " a letter for anyone has no --to"
+        )
+    raise UnknownIdentityError(
+        "refusing to write %r as the %s: not a canonical coop identity.%s\n"
+        "  canonical ids: %s\n"
+        "  rule: one id per surface — terminal CLIs by product name"
+        " (claude-code, codex), WebUI Brains <brain>-forrest, the app's own"
+        " door forrest, BJT dad; a new surface joins CANONICAL_AGENT_IDS in"
+        " bjtCoop coop/compat.py first."
+        % (value, role, hint, ", ".join(CANONICAL_AGENT_IDS))
+    )
+
+
+def assert_no_handoff_pointer(body):
+    """Refuse a letter body that points at a handoff file.
+
+    Coop Quest "a-letter-carries-itself": the body IS the handoff. Each of
+    HANDOFF_STEMS is looked for with `.md`, case-insensitively; only a
+    path-shaped mention (a `/` or `~` right before the stem) is refused — a
+    bare name is talk about the pattern and passes. There is deliberately
+    no override: the caller who would reach for one is the pressed session
+    this checkpoint exists for.
+    """
+    lowered = (body or "").lower()
+    for stem in HANDOFF_STEMS:
+        needle = stem + ".md"
+        start = 0
+        while (hit := lowered.find(needle, start)) != -1:
+            start = hit + 1
+            if hit > 0 and lowered[hit - 1] in "/~":
+                raise HandoffPointerError(
+                    "refusing to write a letter that points at '%s.md' — the"
+                    " letter body IS the handoff. Put the state, the open work"
+                    " and the constraints in the body; a path may locate"
+                    " material too big for the body, never the handoff itself."
+                    % stem
+                )
+
+
+def _record_event(conn, kind, entry_id, event, actor, *, from_status="",
+                  to_status="", reason="", payload=None):
+    """Append one coop_events row inside the caller's write transaction.
+
+    ``kind`` is todo, history, letter, learning or message; ``entry_id`` the
+    row's id in that kind's id space (messages have their own). Nothing
+    updates or deletes a row here: the table's guard triggers refuse both.
+    """
+    conn.execute(
+        "INSERT INTO coop_events (kind, entry_id, event, from_status,"
+        " to_status, actor, reason, payload, at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            kind, int(entry_id), event, from_status or "", to_status or "",
+            actor, reason or "",
+            json.dumps(payload or {}, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")),
+            now_iso(),
+        ),
+    )
+
+
+def list_events(conn, entry_id, *, kind=None, limit=200):
+    """Every recorded transition of one id, oldest first (read-only).
+
+    Entries, letters and learnings share one id space, messages have their
+    own, so without ``kind`` a message's events print beside an entry's
+    with the kind column telling them apart.
+    """
+    where, params = ["entry_id=?"], [int(entry_id)]
+    if kind is not None:
+        where.append("kind=?")
+        params.append(kind)
+    return conn.execute(
+        "SELECT * FROM coop_events WHERE " + " AND ".join(where)
+        + " ORDER BY id LIMIT ?",
+        [*params, limit],
+    ).fetchall()
+
+
+def event_payload(row):
+    try:
+        value = json.loads(row["payload"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 # ---------------------------------------------------------------- library
@@ -728,18 +1243,34 @@ def add_entry(conn, kind, title, body="", project=None, agent=None,
     if assignee is not None and kind != "todo":
         raise ValueError("only a todo has an assignee")
     created = now_iso()
-    author = agent or detect_agent()
+    author = require_canonical_identity(agent or detect_agent())
     status = "open" if kind == "todo" else ""
     final_assignee = (assignee or "").strip() if kind == "todo" else ""
+    if final_assignee:
+        require_canonical_identity(final_assignee, role="assignee")
     final_slug = slug or make_slug(title, created)
-    cur = conn.execute(
-        "INSERT INTO entries (kind, project, agent, machine, title, body, slug, status,"
-        " commit_sha, assignee, created_at, updated_at)"
-        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (kind, project or detect_project(), author,
-         machine or detect_machine(), title, body or "", final_slug, status,
-         commit_sha or "", final_assignee, created, created),
-    )
+    scope = project or detect_project()
+    try:
+        cur = conn.execute(
+            "INSERT INTO entries (kind, project, agent, machine, title, body, slug, status,"
+            " commit_sha, assignee, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (kind, scope, author,
+             machine or detect_machine(), title, body or "", final_slug, status,
+             commit_sha or "", final_assignee, created, created),
+        )
+    except sqlite3.IntegrityError as exc:
+        # history (project, slug) is unique since schema v5; a failed INSERT
+        # must not leave Python's implicit transaction open on this
+        # connection (CLAUDE.md: a 10 ms "database is locked").
+        conn.rollback()
+        existing = get_entry_by_slug(conn, scope, final_slug)
+        if kind == "history" and existing is not None:
+            raise ValueError(
+                "history slug %r already exists in %s as coop #%d"
+                % (final_slug, scope, existing["id"])
+            ) from exc
+        raise
     conn.commit()
     return cur.lastrowid, final_slug
 
@@ -770,33 +1301,438 @@ def set_commit_sha(conn, entry_id, commit_sha):
     return changed > 0
 
 
-def set_status(conn, entry_id, new_status):
-    """Set a todo status; returns True if a row changed.
+def set_status(conn, entry_id, new_status, *, agent=None, reason=None,
+               result=None, commit_sha=None, force=False):
+    """The legacy status door, routed to the lifecycle verbs; True if a todo moved.
 
-    A note became a letter with its own state machine in schema v3
-    (``transition_letter``); its frozen entries row is never rewritten.
+    ``open`` releases a take (``reason`` required), ``taken`` takes,
+    ``done`` closes (or amends a closed row's outcome) and ``abandoned``
+    gives up (``reason`` required). ``read`` and ``superseded`` are legacy
+    values: readable and listable, never written again. Returns False only
+    when the id is not a todo; a move the lifecycle refuses raises
+    LifecycleError. A note became a letter with its own state machine in
+    schema v3 (``transition_letter``); its frozen entries row is never
+    rewritten.
     """
     if new_status not in STATUSES:
         raise ValueError("status must be one of: %s" % ", ".join(STATUSES))
-    cur = conn.execute(
-        "UPDATE entries SET status=?, updated_at=? WHERE id=? AND kind='todo'",
-        (new_status, now_iso(), entry_id),
+    if new_status in TODO_LEGACY_STATUSES:
+        raise LifecycleError(
+            "%r is a legacy todo status, readable but never written again:"
+            " a todo moves with take, release, done or abandon" % new_status
+        )
+    row = get_entry(conn, entry_id)
+    if row is None or row["kind"] != "todo":
+        return False
+    if new_status == "open":
+        release_todo(conn, entry_id, agent=agent, reason=reason or "")
+    elif new_status == "taken":
+        take_todo(conn, entry_id, agent=agent, force=force)
+    elif new_status == "done":
+        done_todo(conn, entry_id, agent=agent, result=result,
+                  commit_sha=commit_sha, force=force)
+    else:
+        abandon_todo(conn, entry_id, agent=agent, reason=reason or "",
+                     force=force)
+    return True
+
+
+def _todo_row(conn, entry_id):
+    """The todo row, inside the caller's write transaction, or a refusal
+    that explains a letter id (the two share one id space)."""
+    row = get_entry(conn, entry_id)
+    if row is None or row["kind"] != "todo":
+        raise LifecycleError(_not_a_todo(conn, entry_id))
+    return row
+
+
+def _letters_mentioning(conn, entry_id):
+    """Ids of live letters whose subject or body says ``#<entry_id>``.
+
+    Coop Quest "a-letter-carries-itself": marking a todo done returns the
+    live letters that mention it, so the CLI can tell the session to ack
+    the letter that asked for the work.
+    """
+    like = "%#" + str(int(entry_id)) + "%"
+    pattern = re.compile(r"(?<![0-9#])#%d(?![0-9])" % int(entry_id))
+    rows = conn.execute(
+        "SELECT id, subject, body FROM letters"
+        " WHERE status IN ('unread','read','working')"
+        " AND (subject LIKE ? OR body LIKE ?) ORDER BY id",
+        (like, like),
+    ).fetchall()
+    return [
+        row["id"] for row in rows
+        if pattern.search(row["subject"] or "") or pattern.search(row["body"] or "")
+    ]
+
+
+def take_todo(conn, entry_id, *, agent=None, force=False, origin=None):
+    """``open → taken`` as one conditional UPDATE; returns the row.
+
+    Coop Quest "lifecycles-and-the-first-close": inside one BEGIN IMMEDIATE
+    the read refuses a terminal row (never re-taken, ``force`` included) and
+    a foreign take without ``force``; the UPDATE's WHERE decides
+    open-or-mine and its rowcount is the verdict (0 rows: changed under this
+    take — re-read and retry). Re-taking one's own row only refreshes
+    ``taken_at``. A forced foreign take is recorded as a ``takeover`` event
+    carrying the previous owner and time, never silently. The legacy
+    ``read`` status is taken like ``open``.
+
+    ``origin`` is what the taking CLI declared about itself
+    (`declare_origin`: chat reference, Mac, working directory; Coop Quest
+    "adopting-a-take"). The domain keeps the reference and the Mac in the
+    take's event; the office's engine records the session, binding and
+    outcome obligation the take owes in this same transaction.
+    """
+    actor = require_canonical_identity(agent or detect_agent())
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = _todo_row(conn, entry_id)
+        if row["status"] in TODO_TERMINAL_STATUSES:
+            raise LifecycleError(
+                "todo #%d is %r — terminal rows are never re-taken"
+                % (entry_id, row["status"])
+            )
+        foreign = (
+            row["status"] == "taken"
+            and bool(row["taken_by"])
+            and row["taken_by"] != actor
+        )
+        if foreign and not force:
+            raise LifecycleError(
+                "todo #%d is already taken by %s (since %s) — --force to take"
+                " it over" % (entry_id, row["taken_by"], row["taken_at"])
+            )
+        stamp = now_iso()
+        if force:
+            guard = "status IN ('open','read','taken')"
+            params = (actor, stamp, stamp, entry_id)
+        else:
+            guard = "(status IN ('open','read') OR taken_by=?)"
+            params = (actor, stamp, stamp, entry_id, actor)
+        cur = conn.execute(
+            "UPDATE entries SET status='taken', taken_by=?, taken_at=?,"
+            " updated_at=? WHERE id=? AND kind='todo' AND " + guard,
+            params,
+        )
+        if cur.rowcount == 0:
+            raise LifecycleError(
+                "todo #%d changed under this take — re-read and retry" % entry_id
+            )
+        payload = (
+            {"previous": row["taken_by"], "previous_at": row["taken_at"]}
+            if foreign else {}
+        )
+        payload.update(_declared(origin))
+        _record_event(
+            conn, "todo", entry_id, "takeover" if foreign else "take", actor,
+            from_status=row["status"], to_status="taken",
+            payload=payload or None,
+        )
+        conn.commit()
+        return get_entry(conn, entry_id)
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _declared(origin):
+    """The chat reference and the Mac a take declared, for its event payload."""
+    if not isinstance(origin, dict):
+        return {}
+    return {key: origin[key] for key in ("session", "host")
+            if isinstance(origin.get(key), str) and origin[key].strip()}
+
+
+def release_todo(conn, entry_id, *, agent=None, reason, evidence=None):
+    """``taken → open`` with a recorded reason; returns the row.
+
+    Coop Quest "lifecycles-and-the-first-close": there is no auto-reap. A
+    stale take is shown ("[taken by X, Nh ago]") and released only by a
+    named decision — the taker, BJT or the chief — with a reason, through
+    this verb, and the event log keeps who decided.
+    """
+    actor = require_canonical_identity(agent or detect_agent())
+    text = (reason or "").strip()
+    if not text:
+        raise ValueError(
+            "a release needs a reason (--reason): releasing a take is a"
+            " named decision, never a timer"
+        )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = _todo_row(conn, entry_id)
+        if row["status"] != "taken":
+            raise LifecycleError(
+                "todo #%d is %s, not taken — nothing to release"
+                % (entry_id, row["status"])
+            )
+        cur = conn.execute(
+            "UPDATE entries SET status='open', taken_by='', taken_at='',"
+            " updated_at=? WHERE id=? AND status='taken'",
+            (now_iso(), entry_id),
+        )
+        if cur.rowcount == 0:
+            raise LifecycleError(
+                "todo #%d changed under this release — re-read and retry" % entry_id
+            )
+        payload = {"previous": row["taken_by"], "previous_at": row["taken_at"]}
+        if evidence:
+            payload["evidence"] = evidence
+        _record_event(
+            conn, "todo", entry_id, "release", actor, from_status="taken",
+            to_status="open", reason=text, payload=payload,
+        )
+        conn.commit()
+        return get_entry(conn, entry_id)
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _amend_outcome(conn, kind, row, *, result_summary, commit_sha, actor):
+    """Amend a closed row's outcome; its closer, time and state never change.
+
+    Coop Quest "lifecycles-and-the-first-close": a second ``done`` may fill
+    or correct ``result_summary`` and ``commit_sha`` only, as an ``edit``
+    event carrying the amender and the previous values; an identical repeat
+    writes nothing. Returns the sorted names of the fields that changed.
+    """
+    changes = {
+        name: value for name, value in
+        (("result_summary", result_summary), ("commit_sha", commit_sha))
+        if value is not None and value != row[name]
+    }
+    if not changes:
+        return []
+    conn.execute(
+        "UPDATE entries SET result_summary=COALESCE(?, result_summary),"
+        " commit_sha=COALESCE(?, commit_sha), updated_at=? WHERE id=?",
+        (changes.get("result_summary"), changes.get("commit_sha"), now_iso(),
+         row["id"]),
     )
-    conn.commit()
-    return cur.rowcount > 0
+    fields = sorted(changes)
+    _record_event(
+        conn, kind, row["id"], "edit", actor,
+        from_status=row["status"], to_status=row["status"],
+        payload={"fields": fields,
+                 "previous": {name: row[name] for name in fields}},
+    )
+    return fields
+
+
+def done_todo(conn, entry_id, *, agent=None, result=None, commit_sha=None,
+              force=False, evidence=None, reply_outcomes=None):
+    """Close a todo as done; the first close is the record.
+
+    Coop Quest "lifecycles-and-the-first-close": ``open → done`` is the
+    legal fast path (an implicit take, so the row names its doer);
+    ``taken → done`` only by the taker unless ``force``. A second ``done``
+    goes to _amend_outcome (result_summary and commit_sha only, as an
+    ``edit`` event; closer, time and status never change). An abandoned
+    todo — or a legacy superseded one — becomes done only with ``force``
+    (BJT's call), and that ``done`` event carries ``previous_status`` for
+    ever.
+
+    ``reply_outcomes`` answers the replies on the todo's thread, one
+    ``{message_id, disposition: applied|not_applied, reason}`` each (Coop
+    Quest "every-reply-answered": "답은 네 영수증에 붙어 저장되고"); the
+    domain stores them in the ``done`` event, the office's engine validates
+    them against the thread when the todo is bound.
+
+    Returns ``{"todo": row, "changed": bool, "amended": [fields],
+    "letters": [ids]}`` — the ids are the live letters that mention
+    ``#<id>``, so the CLI can name the letter that asked for this work.
+    """
+    actor = require_canonical_identity(agent or detect_agent())
+    summary = (result or "").strip()
+    sha = (commit_sha or "").strip()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = _todo_row(conn, entry_id)
+        amended = []
+        changed = False
+        if row["status"] == "done":
+            amended = _amend_outcome(
+                conn, "todo", row, result_summary=summary or None,
+                commit_sha=sha or None, actor=actor,
+            )
+        else:
+            if row["status"] in TODO_TERMINAL_STATUSES and not force:
+                raise LifecycleError(
+                    "todo #%d is %s — the first close is the record;"
+                    " --force (BJT's call) records it done with its previous"
+                    " status in the event" % (entry_id, row["status"])
+                )
+            foreign = (
+                row["status"] == "taken"
+                and bool(row["taken_by"])
+                and row["taken_by"] != actor
+            )
+            if foreign and not force:
+                raise LifecycleError(
+                    "todo #%d is taken by %s — only the taker closes it"
+                    " (--force to override)" % (entry_id, row["taken_by"])
+                )
+            stamp = now_iso()
+            if row["status"] == "taken" and row["taken_by"]:
+                taken_by, taken_at = row["taken_by"], row["taken_at"]
+            else:
+                taken_by, taken_at = actor, stamp
+            cur = conn.execute(
+                "UPDATE entries SET status='done', closed_by=?, closed_at=?,"
+                " taken_by=?, taken_at=?,"
+                " result_summary=CASE WHEN ?='' THEN result_summary ELSE ? END,"
+                " commit_sha=CASE WHEN ?='' THEN commit_sha ELSE ? END,"
+                " updated_at=? WHERE id=? AND status=?",
+                (actor, stamp, taken_by, taken_at, summary, summary, sha, sha,
+                 stamp, entry_id, row["status"]),
+            )
+            if cur.rowcount == 0:
+                raise LifecycleError(
+                    "todo #%d changed under this close — re-read and retry"
+                    % entry_id
+                )
+            payload = {}
+            if row["status"] in TODO_TERMINAL_STATUSES:
+                payload["previous_status"] = row["status"]
+            if foreign:
+                payload["previous_taker"] = row["taken_by"]
+            if evidence:
+                payload["evidence"] = evidence
+            if reply_outcomes:
+                payload["reply_outcomes"] = reply_outcomes
+            _record_event(
+                conn, "todo", entry_id, "done", actor,
+                from_status=row["status"], to_status="done",
+                payload=payload or None,
+            )
+            changed = True
+        letters = _letters_mentioning(conn, entry_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {
+        "todo": get_entry(conn, entry_id), "changed": changed or bool(amended),
+        "amended": amended, "letters": letters,
+    }
+
+
+def abandon_todo(conn, entry_id, *, agent=None, reason, force=False,
+                 evidence=None):
+    """``open | taken → abandoned``: the terminal give-up, with a reason.
+
+    Coop Quest "lifecycles-and-the-first-close": the taker abandons; anyone
+    else needs ``force``. A done todo is never abandoned — its first close
+    is the record (amend the outcome instead) — and an abandoned one stays
+    abandoned unless BJT forces it done.
+    """
+    actor = require_canonical_identity(agent or detect_agent())
+    text = (reason or "").strip()
+    if not text:
+        raise ValueError("abandoning a todo needs a reason (--reason)")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = _todo_row(conn, entry_id)
+        if row["status"] in TODO_TERMINAL_STATUSES:
+            raise LifecycleError(
+                "todo #%d is %s — the first close is the record"
+                % (entry_id, row["status"])
+            )
+        foreign = (
+            row["status"] == "taken"
+            and bool(row["taken_by"])
+            and row["taken_by"] != actor
+        )
+        if foreign and not force:
+            raise LifecycleError(
+                "todo #%d is taken by %s — only the taker abandons it"
+                " (--force to override)" % (entry_id, row["taken_by"])
+            )
+        stamp = now_iso()
+        cur = conn.execute(
+            "UPDATE entries SET status='abandoned', closed_by=?, closed_at=?,"
+            " updated_at=? WHERE id=? AND status=?",
+            (actor, stamp, stamp, entry_id, row["status"]),
+        )
+        if cur.rowcount == 0:
+            raise LifecycleError(
+                "todo #%d changed under this abandon — re-read and retry"
+                % entry_id
+            )
+        payload = {"previous_taker": row["taken_by"]} if foreign else {}
+        if evidence:
+            payload["evidence"] = evidence
+        _record_event(
+            conn, "todo", entry_id, "abandon", actor,
+            from_status=row["status"], to_status="abandoned", reason=text,
+            payload=payload or None,
+        )
+        conn.commit()
+        return get_entry(conn, entry_id)
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def close_todo(conn, entry_id, *, status, actor, result=None, evidence=None,
+               commit_sha=None, force=False):
+    """The engine's one door to a todo outcome (dispatch's settle and facade).
+
+    ``status`` is ``done``, ``abandoned`` or ``open`` (a release); ``result``
+    is the result summary for done and the reason for abandoned and open;
+    ``evidence`` rides in the event payload. ``actor`` is stored as the
+    closer, so it must be a roster id. Returns done_todo's dict for done,
+    ``{"todo": row}`` otherwise; refusals are LifecycleError.
+    """
+    if status == "done":
+        return done_todo(conn, entry_id, agent=actor, result=result,
+                         commit_sha=commit_sha, force=force, evidence=evidence)
+    if status == "abandoned":
+        row = abandon_todo(conn, entry_id, agent=actor, reason=result or "",
+                           force=force, evidence=evidence)
+    elif status == "open":
+        row = release_todo(conn, entry_id, agent=actor, reason=result or "",
+                           evidence=evidence)
+    else:
+        raise ValueError("close_todo status must be done, abandoned or open")
+    return {"todo": row}
 
 
 def assign_todo(conn, entry_id, assignee):
-    """(Re)assign one todo, or unassign it with None; True if a row changed."""
+    """(Re)assign one todo, or unassign it with None; True if a row changed.
+
+    The assignee is checked against the roster (an unassigned todo is
+    anyone's, so ``any`` is never written); the change is an ``assign``
+    event with the previous assignee.
+    """
     value = "" if assignee is None else assignee.strip()
     if assignee is not None and not value:
         raise ValueError("assignee must be non-empty (None unassigns)")
-    cur = conn.execute(
-        "UPDATE entries SET assignee=?, updated_at=? WHERE id=? AND kind='todo'",
-        (value, now_iso(), entry_id),
-    )
-    conn.commit()
-    return cur.rowcount > 0
+    if value:
+        require_canonical_identity(value, role="assignee")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = get_entry(conn, entry_id)
+        if row is None or row["kind"] != "todo":
+            conn.rollback()
+            return False
+        cur = conn.execute(
+            "UPDATE entries SET assignee=?, updated_at=? WHERE id=? AND kind='todo'",
+            (value, now_iso(), entry_id),
+        )
+        _record_event(
+            conn, "todo", entry_id, "assign", detect_agent(),
+            from_status=row["status"], to_status=row["status"],
+            payload={"assignee": value, "previous": row["assignee"]},
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def get_entry(conn, entry_id):
@@ -822,7 +1758,7 @@ def get_entry_by_slug(conn, project, slug):
 
 
 def _entry_filters(kind=None, project=None, status=None, assignee=None,
-                   alias=""):
+                   alias="", taken_by=None):
     """Structured predicates for every live ``entries`` reader.
 
     The first predicate is unconditional: since schema v3 a note lives in
@@ -840,6 +1776,9 @@ def _entry_filters(kind=None, project=None, status=None, assignee=None,
         assignees = (assignee,) if isinstance(assignee, str) else tuple(assignee)
         where.append("%sassignee IN (%s)" % (prefix, ",".join("?" * len(assignees))))
         params.extend(assignees)
+    if taken_by is not None:
+        where.append("%staken_by=?" % prefix)
+        params.append(taken_by)
     if status is not None:
         statuses = (status,) if isinstance(status, str) else tuple(status)
         where.append("%sstatus IN (%s)" % (prefix, ",".join("?" * len(statuses))))
@@ -853,7 +1792,7 @@ def _fts_match(query):
 
 
 def search_rows(conn, query, kind=None, limit=10, *, project=None, status=None,
-                assignee=None):
+                assignee=None, taken_by=None):
     """Search with every structured filter applied *before* LIMIT.
 
     The old HTTP route filtered project/status in Python after this function
@@ -863,7 +1802,7 @@ def search_rows(conn, query, kind=None, limit=10, *, project=None, status=None,
     preserves one SQL owner.
     """
     filters, filter_params = _entry_filters(
-        kind, project, status, assignee, alias="e",
+        kind, project, status, assignee, alias="e", taken_by=taken_by,
     )
     structured_sql = (" AND " + " AND ".join(filters)) if filters else ""
     if FTS_OK:
@@ -887,14 +1826,15 @@ def search_rows(conn, query, kind=None, limit=10, *, project=None, status=None,
 
 
 def list_entries(conn, *, query=None, kind=None, project=None, status=None,
-                 assignee=None, limit=100):
+                 assignee=None, taken_by=None, limit=100):
     """Return newest/ranked entries under one provider-neutral filter API."""
     if query:
         return search_rows(
             conn, query, kind, limit, project=project, status=status,
-            assignee=assignee,
+            assignee=assignee, taken_by=taken_by,
         )
-    where, params = _entry_filters(kind, project, status, assignee)
+    where, params = _entry_filters(kind, project, status, assignee,
+                                   taken_by=taken_by)
     sql = "SELECT * FROM entries"
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -995,7 +1935,10 @@ def add_letter(conn, subject, *, body="", recipient_agent=None,
     if not text:
         raise ValueError("letter subject must not be empty")
     recipient = (recipient_agent or "").strip() or None
-    author = (author_agent or "").strip() or detect_agent()
+    author = require_canonical_identity((author_agent or "").strip() or detect_agent())
+    if recipient is not None:
+        require_canonical_identity(recipient, role="recipient")
+    assert_no_handoff_pointer(body or "")
     scope = project or detect_project()
     host = machine or detect_machine()
     created = now_iso()
@@ -1010,6 +1953,30 @@ def add_letter(conn, subject, *, body="", recipient_agent=None,
              created, created),
         )
         _reserve_entry_id(conn, letter_id)
+        # One live letter per brain (Coop Quest "a-letter-carries-itself"):
+        # the new letter replaces every other live letter this author wrote
+        # in this project to the same address (Forrest keeps `--to`, so the
+        # address is part of "the same brain's letter"). Each old one keeps
+        # its reads and start, points at the new id and gets its own event,
+        # so the chain reads both ways.
+        stale = conn.execute(
+            "SELECT id, status FROM letters WHERE project=? AND author_agent=?"
+            " AND recipient_agent IS ? AND status IN ('unread','read','working')"
+            " AND id != ? ORDER BY id",
+            (scope, author, recipient, letter_id),
+        ).fetchall()
+        for old in stale:
+            conn.execute(
+                "UPDATE letters SET status='superseded', superseded_by=?,"
+                " updated_at=? WHERE id=? AND status=?",
+                (letter_id, created, old["id"], old["status"]),
+            )
+            _record_event(
+                conn, "letter", old["id"], "supersede", author,
+                from_status=old["status"], to_status="superseded",
+                reason="a newer letter from the same author to the same address",
+                payload={"superseded_by": letter_id},
+            )
         conn.commit()
         return letter_id
     except Exception:
@@ -1049,6 +2016,8 @@ def _check_transition(row, action, agent):
                 row["id"], row["recipient_agent"], agent,
             )
         )
+    if action == "read" and row["status"] in ("read", "working"):
+        return  # a later read: no transition, read_count bumps
     sources, target = LETTER_TRANSITIONS[action]
     if row["status"] not in sources:
         raise LetterTransitionError(
@@ -1073,11 +2042,13 @@ def transition_letter(conn, letter_id, action, *, agent, body=None,
     actor = (agent or "").strip()
     if not actor:
         raise ValueError("a letter transition needs the acting agent")
+    require_canonical_identity(actor)
     ack_body = None
     if action == "ack":
         ack_body = (body or "").strip()
         if not ack_body:
             raise ValueError("letter ack requires a non-empty body: say what shipped")
+        assert_no_handoff_pointer(ack_body)
     elif body is not None:
         raise ValueError("only ack takes a body")
     if superseded_by is not None and action != "supersede":
@@ -1102,19 +2073,42 @@ def transition_letter(conn, letter_id, action, *, agent, body=None,
                     "letter #%d is %s and cannot replace another"
                     % (superseded_by, replacement["status"]),
                 )
+        stamp = now_iso()
+        if action == "read" and row["status"] != "unread":
+            # A later read of a live letter: the count and time move, the
+            # state does not (Coop Quest "a-letter-carries-itself").
+            conn.execute(
+                "UPDATE letters SET read_count=read_count+1, last_read_at=?"
+                " WHERE id=?",
+                (stamp, letter_id),
+            )
+            conn.commit()
+            return get_letter(conn, letter_id)
+        bump = 1 if action == "read" else 0
         cur = conn.execute(
             "UPDATE letters SET status=?, worker_agent=?, ack_body=?,"
-            " superseded_by=?, updated_at=? WHERE id=? AND status=?",
+            " superseded_by=?, read_count=read_count+?,"
+            " last_read_at=CASE WHEN ?=1 THEN ? ELSE last_read_at END,"
+            " updated_at=? WHERE id=? AND status=?",
             (
                 target,
                 actor if action == "start" else row["worker_agent"],
                 row["ack_body"] if ack_body is None else ack_body,
                 row["superseded_by"] if superseded_by is None else superseded_by,
-                now_iso(), letter_id, row["status"],
+                bump, bump, stamp,
+                stamp, letter_id, row["status"],
             ),
         )
         if cur.rowcount != 1:  # pragma: no cover - BEGIN IMMEDIATE serializes
             raise LetterTransitionError("letter #%d changed concurrently" % letter_id)
+        _record_event(
+            conn, "letter", letter_id, action, actor,
+            from_status=row["status"], to_status=target,
+            payload=(
+                {"superseded_by": superseded_by} if superseded_by is not None
+                else None
+            ),
+        )
         conn.commit()
         return get_letter(conn, letter_id)
     except Exception:
@@ -1134,6 +2128,7 @@ def read_letters(conn, *, agent, project=None, letter_ids=None):
     actor = (agent or "").strip()
     if not actor:
         raise ValueError("reading letters needs the reading agent")
+    require_canonical_identity(actor)
     conn.execute("BEGIN IMMEDIATE")
     try:
         if letter_ids:
@@ -1153,11 +2148,24 @@ def read_letters(conn, *, agent, project=None, letter_ids=None):
             ).fetchall()
         stamp = now_iso()
         for row in rows:
-            conn.execute(
-                "UPDATE letters SET status='read', updated_at=?"
-                " WHERE id=? AND status='unread'",
-                (stamp, row["id"]),
-            )
+            if row["status"] == "unread":
+                # The first read is the transition; later reads only count
+                # (Coop Quest "a-letter-carries-itself": reading is a write).
+                conn.execute(
+                    "UPDATE letters SET status='read', read_count=read_count+1,"
+                    " last_read_at=?, updated_at=? WHERE id=? AND status='unread'",
+                    (stamp, stamp, row["id"]),
+                )
+                _record_event(
+                    conn, "letter", row["id"], "read", actor,
+                    from_status="unread", to_status="read",
+                )
+            else:
+                conn.execute(
+                    "UPDATE letters SET read_count=read_count+1, last_read_at=?"
+                    " WHERE id=?",
+                    (stamp, row["id"]),
+                )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -1227,7 +2235,8 @@ def letter_counts(conn, *, project=None, addressed_to=None):
 
 
 def add_learning(conn, slug, *, problem, resolution, hypothesis="", source="",
-                 scope="", author_agent=None, project=None, commit_sha=None):
+                 scope="", author_agent=None, project=None, commit_sha=None,
+                 supersedes=None):
     """Write one typed learning and return its id.
 
     ``slug`` names the symptom and ``scope`` the framework or language. The
@@ -1236,6 +2245,12 @@ def add_learning(conn, slug, *, problem, resolution, hypothesis="", source="",
     the rest are optional. Every text is stripped. ``commit_sha`` is for a
     writer that already knows its head; the entry-first flow backfills it
     with ``set_commit_sha``.
+
+    ``supersedes`` names the learning this one corrects (Coop Quest
+    "seven-tables-and-a-roster": the old row is never overwritten; its
+    ``superseded_by`` points at the fix so "we used to think" stays
+    readable). An already superseded learning is refused: supersede the
+    one that replaced it.
     """
     text = {
         name: (value or "").strip()
@@ -1247,12 +2262,21 @@ def add_learning(conn, slug, *, problem, resolution, hypothesis="", source="",
     for name in ("slug", "problem", "resolution"):
         if not text[name]:
             raise ValueError("a learning needs a non-empty %s" % name)
-    author = (author_agent or "").strip() or detect_agent()
+    author = require_canonical_identity((author_agent or "").strip() or detect_agent())
     owner = project or detect_project()
     created = now_iso()
     conn.execute("BEGIN IMMEDIATE")
     try:
         learning_id = _next_ledger_id(conn)
+        if supersedes is not None:
+            old = get_learning(conn, supersedes)
+            if old is None:
+                raise ValueError("no learning with id %d to supersede" % supersedes)
+            if _field(old, "superseded_by"):
+                raise ValueError(
+                    "learning #%d is already superseded by #%d; supersede that one"
+                    % (supersedes, old["superseded_by"])
+                )
         conn.execute(
             "INSERT INTO learning_entries (id, project, author_agent, scope,"
             " slug, problem, hypothesis, resolution, source, commit_sha,"
@@ -1262,6 +2286,15 @@ def add_learning(conn, slug, *, problem, resolution, hypothesis="", source="",
              text["source"], (commit_sha or "").strip(), created),
         )
         _reserve_entry_id(conn, learning_id)
+        if supersedes is not None:
+            conn.execute(
+                "UPDATE learning_entries SET superseded_by=? WHERE id=?",
+                (learning_id, supersedes),
+            )
+            _record_event(
+                conn, "learning", supersedes, "supersede", author,
+                payload={"superseded_by": learning_id},
+            )
         conn.commit()
         return learning_id
     except Exception:
@@ -1332,11 +2365,21 @@ def learning_counts(conn, *, project=None):
 # peer, whom it should ask, or how it should use the reply.
 
 
-def _normalize_intent(intent):
+def _normalize_intent(intent, *, strict=True):
+    """The intent a message carries; a write must name one of MESSAGE_INTENTS.
+
+    Reads (``strict=False``) stay lenient: a filter may ask for any old
+    value, and the rows written before the set was closed keep theirs.
+    """
     value = (intent or "request").strip().lower()
     if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", value):
         raise ValueError(
             "intent must match [a-z][a-z0-9_.-]{0,63}",
+        )
+    if strict and value not in MESSAGE_INTENTS:
+        raise ValueError(
+            "intent %r is not one the mailbox processes; use one of: %s"
+            % (value, ", ".join(MESSAGE_INTENTS))
         )
     return value
 
@@ -1388,6 +2431,11 @@ def _insert_message(conn, subject, *, recipient_agent, sender_agent,
             refs_json, status, source_key or "", created, updated,
         ),
     )
+    if reply_to is not None and cur.rowcount and getattr(conn, 'office_writer', False):
+        # Only the owning office has this business transition. Exported
+        # standalone clients route their public writes to that same owner.
+        from . import engine
+        engine.answer_parked_from_reply(conn, cur.lastrowid)
     return cur.lastrowid, final_thread
 
 
@@ -1395,10 +2443,12 @@ def add_message(conn, subject, *, recipient_agent, sender_agent=None,
                 intent="request", body="", artifact_refs=None, project=None,
                 machine=None, thread_id=None, reply_to=None):
     """Send one durable message; returns ``(id, thread_id)``."""
+    sender = require_canonical_identity(sender_agent or detect_agent())
+    require_canonical_identity(recipient_agent, role="recipient")
     result = _insert_message(
         conn, subject,
         recipient_agent=recipient_agent,
-        sender_agent=sender_agent or detect_agent(),
+        sender_agent=sender,
         intent=intent,
         body=body,
         artifact_refs=artifact_refs,
@@ -1425,6 +2475,8 @@ def add_message_once(conn, subject, *, source_key, recipient_agent,
     key = str(source_key or "").strip()
     if not key:
         raise ValueError("source_key must not be empty")
+    sender = require_canonical_identity(sender_agent or detect_agent())
+    require_canonical_identity(recipient_agent, role="recipient")
     conn.execute("BEGIN IMMEDIATE")
     try:
         existing = conn.execute(
@@ -1438,7 +2490,7 @@ def add_message_once(conn, subject, *, source_key, recipient_agent,
             conn,
             subject,
             recipient_agent=recipient_agent,
-            sender_agent=sender_agent or detect_agent(),
+            sender_agent=sender,
             intent=intent,
             body=body,
             artifact_refs=artifact_refs,
@@ -1507,7 +2559,7 @@ def list_active_root_messages(conn, *, project, intents):
     admission guards must not forget an old claimed unit merely because newer
     mailbox traffic pushed it past a display LIMIT.
     """
-    normalized = tuple(_normalize_intent(intent) for intent in intents)
+    normalized = tuple(_normalize_intent(intent, strict=False) for intent in intents)
     if not normalized:
         return []
     placeholders = ",".join("?" for _ in normalized)
@@ -1568,8 +2620,15 @@ def message_counts(conn, *, project=None, recipient_agent=None):
     return counts
 
 
-def claim_message(conn, message_id, agent):
-    """Atomically claim one open message addressed to ``agent``."""
+def claim_message(conn, message_id, agent, origin=None):
+    """Atomically claim one open message addressed to ``agent``.
+
+    ``origin`` is what the claiming CLI declared (`declare_origin`); the
+    event keeps its chat reference and Mac, and the office's engine records
+    the observed session and the outcome obligation a terminal claim owes
+    (Coop Quest "adopting-a-take").
+    """
+    require_canonical_identity(agent)
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = get_message(conn, message_id)
@@ -1592,6 +2651,11 @@ def claim_message(conn, message_id, agent):
         )
         if cur.rowcount != 1:  # pragma: no cover - BEGIN IMMEDIATE serializes
             raise ValueError("message #%d was claimed concurrently" % message_id)
+        _record_event(
+            conn, "message", message_id, "claim", agent,
+            from_status="open", to_status="claimed",
+            payload=_declared(origin) or None,
+        )
         conn.commit()
         return get_message(conn, message_id)
     except Exception:
@@ -1600,18 +2664,31 @@ def claim_message(conn, message_id, agent):
 
 
 def release_message(conn, message_id, agent):
-    cur = conn.execute(
-        "UPDATE messages SET status='open', claimed_by='', updated_at=?"
-        " WHERE id=? AND status='claimed' AND claimed_by=?",
-        (now_iso(), message_id, agent),
-    )
-    conn.commit()
-    return cur.rowcount == 1
+    """Release one's own claim; True if the message went back to open."""
+    require_canonical_identity(agent)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = conn.execute(
+            "UPDATE messages SET status='open', claimed_by='', updated_at=?"
+            " WHERE id=? AND status='claimed' AND claimed_by=?",
+            (now_iso(), message_id, agent),
+        )
+        if cur.rowcount == 1:
+            _record_event(
+                conn, "message", message_id, "release", agent,
+                from_status="claimed", to_status="open",
+            )
+        conn.commit()
+        return cur.rowcount == 1
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def finish_message(conn, message_id, agent, status="done"):
     if status not in ("done", "superseded"):
         raise ValueError("finished message status must be done or superseded")
+    require_canonical_identity(agent)
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = get_message(conn, message_id)
@@ -1632,6 +2709,11 @@ def finish_message(conn, message_id, agent, status="done"):
         )
         if cur.rowcount != 1:  # pragma: no cover - BEGIN IMMEDIATE serializes
             raise ValueError("message #%d changed concurrently" % message_id)
+        _record_event(
+            conn, "message", message_id,
+            "done" if status == "done" else "supersede", agent,
+            from_status=row["status"], to_status=status,
+        )
         conn.commit()
         return True
     except Exception:
@@ -1642,6 +2724,7 @@ def finish_message(conn, message_id, agent, status="done"):
 def reply_message(conn, message_id, *, sender_agent, body, subject=None,
                   intent="response", artifact_refs=None):
     """Reply in-thread and close the addressed parent atomically."""
+    require_canonical_identity(sender_agent)
     conn.execute("BEGIN IMMEDIATE")
     try:
         parent = get_message(conn, message_id)
@@ -1681,6 +2764,11 @@ def reply_message(conn, message_id, *, sender_agent, body, subject=None,
             "UPDATE messages SET status='done', claimed_by='', updated_at=?"
             " WHERE id=?",
             (now_iso(), message_id),
+        )
+        _record_event(
+            conn, "message", message_id, "reply", sender_agent,
+            from_status=parent["status"], to_status="done",
+            payload={"reply_id": reply_id},
         )
         conn.commit()
         return get_message(conn, reply_id), thread_id
@@ -1876,6 +2964,7 @@ def cmd_learn(args):
             source=read_body(args.source),
             scope=args.scope,
             author_agent=args.agent, project=args.project, commit_sha=args.sha,
+            supersedes=args.supersedes,
         )
         row = get_learning(conn, learning_id)
     except ValueError as exc:
@@ -1883,6 +2972,9 @@ def cmd_learn(args):
     finally:
         conn.close()
     print("coop #%d learning recorded — %s" % (learning_id, row["slug"]))
+    if args.supersedes is not None:
+        print("(supersedes learning #%d; it stays readable, pointing here)"
+              % args.supersedes)
     if not args.sha:
         print("(entry-first flow: after the commit lands, backfill with "
               "`coop.py sha %d <head>`)" % learning_id)
@@ -1950,22 +3042,156 @@ def cmd_sha(args):
     print("coop #%d sha=%s" % (args.id, args.commit_sha))
 
 
+def _parse_reply_outcome(text):
+    """`<message id>:<applied|not_applied>:<one-line reason>` → the lesson's shape."""
+    parts = text.split(":", 2)
+    if (len(parts) != 3 or not parts[0].strip().isdigit()
+            or parts[1].strip() not in ("applied", "not_applied")
+            or not parts[2].strip()):
+        raise ValueError(
+            "--reply-outcome takes <message id>:<applied|not_applied>:<one-line"
+            " reason>, got %r" % text
+        )
+    return {"message_id": int(parts[0]), "disposition": parts[1].strip(),
+            "reason": parts[2].strip()}
+
+
+def _owed_line(row, entry_id):
+    """The outcome a take through the office owes, when the office answered one.
+
+    Coop Quest "an-outcome-is-owed": the take and the debt are written
+    together; the taker's own `done --result` / `release` / `abandon` (a
+    claim's `reply` / `message-done` / `message-release`) is the report that
+    discharges it, and the chief reviews it after three hours otherwise.
+    """
+    owed = row["obligation"] if "obligation" in row.keys() else None
+    if not owed:
+        return ""
+    return ("  owes an outcome by %s — your own done/release/abandon (reply or"
+            " message-done for a claim) is its report; otherwise the chief reviews"
+            " #%d then" % (owed["due_at"], entry_id))
+
+
 def cmd_status(args):
-    new_status = "done" if args.cmd == "done" else args.status
+    """`take`, `release`, `done`, `abandon`, and the legacy `status` door.
+
+    Coop Quest "lifecycles-and-the-first-close": every verb is a function
+    that checks the current state, moves it and appends an event; `done`
+    also names the live letters that mention the todo so the session acks
+    the letter that asked for the work. A take the office records owes an
+    outcome ("adopting-a-take"); the CLI says so and names the report.
+    """
+    agent = detect_agent(getattr(args, "agent", None))
+    force = bool(getattr(args, "force", False))
     conn = connect()
     try:
-        changed = set_status(conn, args.id, new_status)
-        if not changed:
-            sys.exit(_not_a_todo(conn, args.id))
-    except ValueError as exc:
+        if args.cmd == "done":
+            outcome = done_todo(
+                conn, args.id, agent=agent, result=args.result,
+                commit_sha=args.sha, force=force,
+                reply_outcomes=[_parse_reply_outcome(text)
+                                for text in (getattr(args, "reply_outcome", None) or [])],
+            )
+            if outcome["amended"]:
+                print("coop #%d is already done — amended %s (an `edit` event;"
+                      " closer, time and status unchanged)"
+                      % (args.id, ", ".join(outcome["amended"])))
+            elif not outcome["changed"]:
+                print("coop #%d is already done — an identical repeat writes"
+                      " nothing" % args.id)
+            else:
+                print("coop #%d -> done" % args.id)
+            if outcome["letters"]:
+                print("(live letters mentioning #%d: %s — `coop.py letter ack"
+                      " <id> --body …` if this was their work)" % (
+                          args.id,
+                          ", ".join("#%d" % n for n in outcome["letters"]),
+                      ))
+        elif args.cmd == "take":
+            row = take_todo(conn, args.id, agent=agent, force=force)
+            print("coop #%d -> taken by %s" % (args.id, row["taken_by"]))
+            if _owed_line(row, args.id):
+                print(_owed_line(row, args.id))
+        elif args.cmd == "release":
+            release_todo(conn, args.id, agent=agent, reason=args.reason)
+            print("coop #%d -> open (released)" % args.id)
+        elif args.cmd == "abandon":
+            abandon_todo(conn, args.id, agent=agent, reason=args.reason,
+                         force=force)
+            print("coop #%d -> abandoned" % args.id)
+        else:
+            changed = set_status(
+                conn, args.id, args.status, agent=agent, reason=args.reason,
+                result=args.result, commit_sha=args.sha, force=force,
+            )
+            if not changed:
+                sys.exit(_not_a_todo(conn, args.id))
+            print("coop #%d -> %s" % (args.id, args.status))
+    except ValueError as exc:  # LifecycleError, UnknownIdentityError included
         sys.exit(str(exc))
     finally:
         conn.close()
-    print("coop #%d -> %s" % (args.id, new_status))
+
+
+def cmd_events(args):
+    """`events <id>`: the append-only transition log of one row."""
+    conn = connect()
+    try:
+        rows = list_events(conn, args.id, kind=args.kind)
+    finally:
+        conn.close()
+    if not rows:
+        print("coop: no events for #%d" % args.id)
+        return
+    for row in rows:
+        print(format_event(row))
+
+
+def format_event(row):
+    move = (
+        "%s → %s" % (row["from_status"], row["to_status"])
+        if row["from_status"] or row["to_status"] else ""
+    )
+    extra = []
+    if row["reason"]:
+        extra.append(row["reason"])
+    payload = event_payload(row)
+    if payload:
+        extra.append(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return "%s  %-8s #%-5d %-9s %s · %s%s" % (
+        row["at"][:16].replace("T", " "), row["kind"], row["entry_id"],
+        row["event"], move, row["actor"],
+        (" · " + " · ".join(extra)) if extra else "",
+    )
+
+
+def _age(stamp):
+    """`3h ago` for an ISO stamp; `?` when it cannot be read."""
+    try:
+        then = dt.datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return "?"
+    if then.tzinfo is None:
+        then = then.astimezone()
+    seconds = max(0, (dt.datetime.now(dt.timezone.utc) - then).total_seconds())
+    if seconds < 3600:
+        return "%dm ago" % (seconds // 60)
+    if seconds < 48 * 3600:
+        return "%dh ago" % (seconds // 3600)
+    return "%dd ago" % (seconds // 86400)
 
 
 def format_row(r):
-    flag = (" [%s]" % r["status"]) if r["status"] not in ("", "done") else ""
+    # A take is shown, never reaped (Coop Quest "lifecycles-and-the-first-close":
+    # "[taken by X, Nh ago]"); done rows carry no flag, as before.
+    if r["status"] == "taken":
+        flag = " [taken by %s, %s]" % (
+            _field(r, "taken_by") or "?", _age(_field(r, "taken_at")),
+        )
+    elif r["status"] not in ("", "done"):
+        flag = " [%s]" % r["status"]
+    else:
+        flag = ""
     who = r["agent"]
     if r["kind"] == "todo" and r["assignee"]:
         who = "%s -> %s" % (r["agent"], r["assignee"])
@@ -1990,6 +3216,10 @@ def format_letter(row):
 def print_letter(row):
     print(format_letter(row))
     print("machine: %s · updated: %s" % (row["machine"], row["updated_at"]))
+    if _field(row, "read_count", 0):
+        print("read %d time(s) · last read: %s" % (
+            row["read_count"], _field(row, "last_read_at") or "?",
+        ))
     if row["body"]:
         print("\n" + row["body"])
     if row["ack_body"]:
@@ -2000,9 +3230,11 @@ def print_letter(row):
 
 def format_learning(row):
     symptom = "%s: %s" % (row["scope"], row["slug"]) if row["scope"] else row["slug"]
-    return "#%-4d %-8s %s  %s · %s · %s" % (
+    superseded = _field(row, "superseded_by")
+    return "#%-4d %-8s %s  %s · %s · %s%s" % (
         row["id"], "learning", row["created_at"][:16].replace("T", " "),
         symptom, row["project"], row["author_agent"],
+        (" [superseded by #%d]" % superseded) if superseded else "",
     )
 
 
@@ -2010,6 +3242,9 @@ def print_learning(row):
     print(format_learning(row))
     if row["commit_sha"]:
         print("commit: %s" % row["commit_sha"])
+    if _field(row, "superseded_by"):
+        print("superseded by learning #%d (kept as what we used to think)"
+              % row["superseded_by"])
     for field in ("problem", "hypothesis", "resolution", "source"):
         if row[field]:
             print("\n%s: %s" % (field, row[field]))
@@ -2259,6 +3494,8 @@ def cmd_message_claim(args):
     finally:
         conn.close()
     print("coop message #%d claimed by %s" % (args.id, row["claimed_by"]))
+    if _owed_line(row, args.id):
+        print(_owed_line(row, args.id))
 
 
 def cmd_message_release(args):
@@ -2407,8 +3644,10 @@ def cmd_brief(args):
         machine = detect_machine()
         truth = ground_truth_host()
         print("━━ coop session brief ━━")
-        if machine == truth:
-            print("Machine : %s — GROUND-TRUTH server (coop DB + git origin live here)" % machine)
+        if is_ground_truth_machine():
+            print("Machine : %s — GROUND-TRUTH service (Coop DB lives here; code origin follows workbench)" % machine)
+        elif ark_profile():
+            print("Machine : %s — ARK independent branch %s (canonical role unchanged)" % (machine, ark_profile()['branch_id']))
         else:
             print("Machine : %s — SATELLITE (ground truth: %s)" % (machine, truth))
             print("  ⚠ You are NOT on the ground-truth machine. Pull before working;"
@@ -2423,10 +3662,20 @@ def cmd_brief(args):
         # Read-only by contract: only an explicit `letter read` marks a
         # letter read, so the card lists what is waiting without moving it.
         _print_brief_letters(conn, project, agent)
-        todos = list_entries(
-            conn, kind="todo", status=("open", "read"), project=project,
-            assignee=(agent, ""), limit=BRIEF_ITEM_LIMIT + 1,
-        )
+        # The agent's and unassigned active todos, plus the ones it has
+        # taken whoever they were assigned to; a take is shown, never reaped.
+        todos = {
+            row["id"]: row for row in list_entries(
+                conn, kind="todo", status=TODO_ACTIVE_STATUSES, project=project,
+                assignee=(agent, ""), limit=BRIEF_ITEM_LIMIT + 1,
+            )
+        }
+        for row in list_entries(
+            conn, kind="todo", status="taken", project=project,
+            taken_by=agent, limit=BRIEF_ITEM_LIMIT + 1,
+        ):
+            todos.setdefault(row["id"], row)
+        todos = [todos[key] for key in sorted(todos, reverse=True)]
         if todos:
             print("Todos   : (%s's and unassigned, in %s)" % (agent, project))
             for r in todos[:BRIEF_ITEM_LIMIT]:
@@ -2539,6 +3788,9 @@ def main(argv=None):
                    help="optional: the framework or language (sqlite, tauri, mps)")
     s.add_argument("--sha", help="git head when already known "
                    "(machine writers / retroactive records)")
+    s.add_argument("--supersedes", type=int, metavar="ID",
+                   help="the learning this one corrects (it stays readable,"
+                        " pointing here)")
     s.add_argument("--project")
     s.add_argument("--agent")
 
@@ -2591,11 +3843,51 @@ def main(argv=None):
     s.add_argument("id", type=int)
     s.add_argument("commit_sha")
 
-    s = sub.add_parser("done")
+    # The todo lifecycle (Coop Quest "lifecycles-and-the-first-close"):
+    # open → taken → done | abandoned, release back to open, and the fast
+    # path `done` on an open todo. `status` is the legacy door routed to
+    # the same verbs.
+    s = sub.add_parser("take", help="open → taken (your name on it)")
     s.add_argument("id", type=int)
-    s = sub.add_parser("status")
+    s.add_argument("--force", action="store_true",
+                   help="take over someone else's take (recorded as a takeover)")
+    s.add_argument("--agent")
+    s = sub.add_parser("release", help="taken → open, with a reason")
+    s.add_argument("id", type=int)
+    s.add_argument("--reason", required=True,
+                   help="why the take is released (a named decision)")
+    s.add_argument("--agent")
+    s = sub.add_parser("done", help="open|taken → done; again: amend the outcome")
+    s.add_argument("id", type=int)
+    s.add_argument("--result", help="result summary (what shipped); the report"
+                   " of a take the office records")
+    s.add_argument("--sha", help="the commit that closed it")
+    s.add_argument("--reply-outcome", action="append", default=[],
+                   metavar="ID:applied|not_applied:REASON",
+                   help="answer one reply on the todo's thread; repeat for each"
+                        " (a bound todo's done must answer every reply)")
+    s.add_argument("--force", action="store_true",
+                   help="close someone else's take, or record an abandoned"
+                        " todo done (BJT's call; the event keeps the reversal)")
+    s.add_argument("--agent")
+    s = sub.add_parser("abandon", help="open|taken → abandoned, with a reason")
+    s.add_argument("id", type=int)
+    s.add_argument("--reason", required=True, help="why the work is given up")
+    s.add_argument("--force", action="store_true",
+                   help="abandon someone else's take")
+    s.add_argument("--agent")
+    s = sub.add_parser("status", help="legacy door to the same verbs")
     s.add_argument("id", type=int)
     s.add_argument("status", choices=STATUSES)
+    s.add_argument("--reason")
+    s.add_argument("--result")
+    s.add_argument("--sha")
+    s.add_argument("--force", action="store_true")
+    s.add_argument("--agent")
+    s = sub.add_parser("events", help="the append-only transition log of one id")
+    s.add_argument("id", type=int)
+    s.add_argument("--kind", choices=("todo", "history", "letter", "learning",
+                                      "message"))
     s = sub.add_parser("show")
     s.add_argument("id", type=int)
 
@@ -2682,8 +3974,10 @@ def main(argv=None):
             cmd_letter_move(args)
     elif args.cmd == "sha":
         cmd_sha(args)
-    elif args.cmd in ("done", "status"):
+    elif args.cmd in ("take", "release", "done", "abandon", "status"):
         cmd_status(args)
+    elif args.cmd == "events":
+        cmd_events(args)
     elif args.cmd == "recent":
         cmd_recent(args)
     elif args.cmd == "search":
@@ -2714,6 +4008,7 @@ def main(argv=None):
 # its source; callers keep their established imports and CLI vocabulary.
 WRITE_METHODS = (
     "add_entry", "set_commit_sha", "set_status", "assign_todo",
+    "take_todo", "release_todo", "done_todo", "abandon_todo", "close_todo",
     "add_letter", "transition_letter", "read_letters", "add_learning",
     "add_message", "add_message_once", "claim_message", "release_message",
     "finish_message", "reply_message",
@@ -2750,6 +4045,42 @@ def _read_owner(path):
     return owner
 
 
+def operator_token(db_path=None):
+    token = os.environ.get("COOP_OPERATOR_TOKEN", "").strip()
+    if not token:
+        path = Path(os.environ.get("COOP_OPERATOR_KEY_FILE", str(db_path or DEFAULT_DB) + ".operator.key")).expanduser()
+        status = path.stat()
+        if status.st_uid != os.getuid() or status.st_mode & 0o077:
+            raise LedgerUnavailable("Coop operator key must be private to its owner")
+        token = path.read_text().strip()
+    if len(token) < 32 or any(char.isspace() for char in token):
+        raise LedgerUnavailable("Coop operator bearer is unavailable")
+    return token
+
+
+def _office_target(db_path):
+    profile = ark_profile()
+    if profile and profile.get('members', {}).get('coop') != 'run':
+        raise LedgerUnavailable('Ark Coop is held; canonical routing is not a fallback')
+    if os.path.realpath(db_path) != os.path.realpath(DEFAULT_DB) or is_local_office_owner():
+        owner = _read_owner(db_path)
+        return owner['url'] + '/rpc', owner['token'], owner['instance']
+    family = _family_ledger()
+    member = family.get('members', {}).get('coop', {})
+    machine = family['machines'][family['roles']['forrest']]
+    dns = machine.get('magic_dns')
+    path = member.get('compat_path')
+    if (member.get('host') != '@forrest'
+            or not isinstance(dns, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]*', dns)
+            or path != '/api/coop/compat'):
+        raise LedgerUnavailable('Coop has no registered HTTPS compatibility gateway')
+    port = member.get('https_port', 443)
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise LedgerUnavailable('Coop HTTPS port is invalid')
+    origin = 'https://' + dns.lower().rstrip('.') + ((':' + str(port)) if port != 443 else '')
+    return origin + path, operator_token(db_path), None
+
+
 def _save_receipt(path, receipt):
     directory = Path(str(path) + ".receipts")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -2761,6 +4092,45 @@ def _save_receipt(path, receipt):
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, destination)
+
+
+def _prune_receipts(db_path, *, now=None):
+    """Delete settled receipt files older than a day, at most once an hour.
+
+    Coop Quest "the-owner-file-fails-closed": settled receipts (committed or
+    rejected) are deleted after a day; the sweep runs at most hourly (537
+    files had piled up in three days); an uncertain receipt stays until
+    someone reconciles it. A file whose verdict cannot be read is kept too:
+    it is not known to be settled. The hourly stamp is `.pruned-at` in the
+    receipts directory. Never raises; returns how many files went.
+    """
+    directory = Path(str(db_path) + ".receipts")
+    stamp = directory / ".pruned-at"
+    moment = time.time() if now is None else now
+    removed = 0
+    try:
+        if (stamp.exists()
+                and moment - stamp.stat().st_mtime < RECEIPT_PRUNE_INTERVAL_SECONDS):
+            return 0
+        with os.scandir(directory) as found:
+            for entry in found:
+                if not entry.name.endswith(".json"):
+                    continue
+                try:
+                    if moment - entry.stat().st_mtime < RECEIPT_RETENTION_SECONDS:
+                        continue
+                    with open(entry.path, encoding="utf-8") as handle:
+                        verdict = json.load(handle).get("verdict")
+                    if verdict in ("committed", "rejected"):
+                        os.unlink(entry.path)
+                        removed += 1
+                except (OSError, ValueError, AttributeError):
+                    continue
+        stamp.touch()
+        os.utime(stamp, (moment, moment))
+    except OSError:
+        pass
+    return removed
 
 
 class _NoRedirect(urlrequest.HTTPRedirectHandler):
@@ -2781,14 +4151,20 @@ def office_call(method, params=None, *, path=None, mutating=True, request_id=Non
     receipt = {"request_id": rid, "method": method, "verdict": "uncertain"}
     if mutating:
         _save_receipt(db_path, receipt)
+
+    def settle():
+        if mutating:
+            _save_receipt(db_path, receipt)
+            _prune_receipts(db_path)
+
     status = None
     try:
-        owner = _read_owner(db_path)
+        endpoint, token, instance = _office_target(db_path)
         payload = {"request_id": rid, "method": method, "params": params or {},
                    "workspace_fence": {k: os.environ[k] for k in WORKSPACE_FENCE_KEYS if k in os.environ}}
         req = urlrequest.Request(
-            owner["url"] + "/rpc", data=json.dumps(payload).encode(),
-            headers={"Authorization": "Bearer " + owner["token"],
+            endpoint, data=json.dumps(payload).encode(),
+            headers={"Authorization": "Bearer " + token,
                      "Content-Type": "application/json"}, method="POST",
         )
         opener = urlrequest.build_opener(urlrequest.ProxyHandler({}), _NoRedirect())
@@ -2806,11 +4182,11 @@ def office_call(method, params=None, *, path=None, mutating=True, request_id=Non
         except (ValueError, UnicodeDecodeError):
             domain = None
         valid = (isinstance(domain, dict) and domain.get("request_id") == rid
-                 and domain.get("instance") == owner["instance"])
+                 and isinstance(domain.get("instance"), str) and bool(domain["instance"])
+                 and (instance is None or domain["instance"] == instance))
         if valid and status == 200 and domain.get("verdict") == "committed" and "result" in domain:
             receipt.update(verdict="committed", http_status=status)
-            if mutating:
-                _save_receipt(db_path, receipt)
+            settle()
             return domain["result"]
         receipt.update(http_status=status,
                        verdict="rejected" if status in (401, 403, 422) else "uncertain",
@@ -2818,19 +4194,27 @@ def office_call(method, params=None, *, path=None, mutating=True, request_id=Non
         if valid and domain.get("verdict") == "rejected":
             receipt.update(verdict="rejected", error=domain.get("error", "rejected"))
             error_kind = domain.get("error_type")
-            if mutating:
-                _save_receipt(db_path, receipt)
-            if error_kind == "LetterNotFound":
-                raise LetterNotFound(receipt["error"])
-            if error_kind == "LetterTransitionError":
-                raise LetterTransitionError(receipt["error"])
-    except (OSError, ValueError) as exc:
-        if isinstance(exc, LetterTransitionError):
+            settle()
+            if error_kind in _DOMAIN_ERRORS:
+                raise _DOMAIN_ERRORS[error_kind](receipt["error"])
+    except (OSError, ValueError, LedgerUnavailable) as exc:
+        if isinstance(exc, tuple(_DOMAIN_ERRORS.values())):
             raise
         receipt.update(error=str(exc), http_status=status)
-    if mutating:
-        _save_receipt(db_path, receipt)
+    settle()
     raise (OfficeRejected if receipt["verdict"] == "rejected" else OfficeCallError)(receipt)
+
+
+# The office answers a domain refusal with the exception's class name; the
+# client raises the same class so a caller sees one vocabulary either side
+# of the process boundary.
+_DOMAIN_ERRORS = {
+    "LetterNotFound": LetterNotFound,
+    "LetterTransitionError": LetterTransitionError,
+    "LifecycleError": LifecycleError,
+    "UnknownIdentityError": UnknownIdentityError,
+    "HandoffPointerError": HandoffPointerError,
+}
 
 
 def _office_writer(fn):
@@ -2846,10 +4230,11 @@ def _office_writer(fn):
         bound.apply_defaults()
         params = dict(bound.arguments)
         params.pop("conn")
-        # Resolve caller-local identity before crossing the process boundary.
+        # Resolve caller-local identity before crossing the process boundary;
+        # a take's origin (its chat, its Mac, its cwd) is caller-local too.
         for key, default in (("project", detect_project), ("agent", detect_agent),
                              ("author_agent", detect_agent), ("sender_agent", detect_agent),
-                             ("machine", detect_machine)):
+                             ("machine", detect_machine), ("origin", declare_origin)):
             if key in params and not params[key]:
                 # None on read_letters means all projects, not caller project.
                 if fn.__name__ == "read_letters" and key == "project":

@@ -44,9 +44,10 @@ On the ground-truth host the client needs read/write access to
 means the inbox and WorkUnits were not loaded, not that they are empty.
 Request/allow access and rerun the command before starting project work.
 
-Retrieve relevant history before deep diagnosis. After verification, record
-the unit with `coop.py log` BEFORE the commit; after commit and push, backfill
-with `coop.py sha <entry-id> <sha>`. Record reusable lessons with `coop.py learn`. The generic
+Retrieve relevant history before deep diagnosis. A dispatched WorkUnit writes
+no Coop history row of its own: since 2026-10-04 its `work_result` reply is
+the record. An ordinary session keeps the Coop brief's per-unit history rule.
+Record reusable lessons with `coop.py learn`. The generic
 mailbox (`send`, `inbox`, `message-claim`, `reply`, `message-done`) is available
 when another Forrest, Codex, or Claude builder would materially help. Coop is
 logically scoped by this Git root's `lotto` project name and does not replace

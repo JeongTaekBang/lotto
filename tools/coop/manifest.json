@@ -1,0 +1,14 @@
+{
+  "source": "bjtCoop",
+  "source_commit": "098f30d0a05101a365cdab99b39764f43df68ffc",
+  "files": {
+    "coop.py": {
+      "source_path": "coop/compat.py",
+      "sha256": "9a5efa110005bd04e1f9ce99ee235617a015fd4c0fbcaee502931804c9f7ec51"
+    },
+    "family-ledger.json": {
+      "source_path": "coop/family-ledger.json",
+      "sha256": "d8b103e1763ce5b46ec4e42ca1276117c1e01ef5620b67d0a4c4a6f84783c1ef"
+    }
+  }
+}
