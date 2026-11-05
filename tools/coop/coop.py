@@ -17,7 +17,10 @@ session ritual is `letter read` (the only command that marks letters read),
 shipped. A take from a terminal (`take`, `message-claim`) is a take the
 office records: an observed session that owes an outcome within three hours,
 discharged by the taker's own `done`/`release`/`abandon` (Coop Quest
-"adopting-a-take", "an-outcome-is-owed").
+"adopting-a-take", "an-outcome-is-owed"), which carry `--for-dad`, the two
+or three Korean lines Dad reads of it (Master Chief
+"the-worker-and-its-report"; the office requires them where the close
+reaches him).
 
 Learnings are history's typed sister table (schema v4, Memory L6
 `learning_entries`): history asks what a session did, a learning what a
@@ -1302,7 +1305,7 @@ def set_commit_sha(conn, entry_id, commit_sha):
 
 
 def set_status(conn, entry_id, new_status, *, agent=None, reason=None,
-               result=None, commit_sha=None, force=False):
+               result=None, commit_sha=None, force=False, for_dad=None):
     """The legacy status door, routed to the lifecycle verbs; True if a todo moved.
 
     ``open`` releases a take (``reason`` required), ``taken`` takes,
@@ -1312,7 +1315,7 @@ def set_status(conn, entry_id, new_status, *, agent=None, reason=None,
     when the id is not a todo; a move the lifecycle refuses raises
     LifecycleError. A note became a letter with its own state machine in
     schema v3 (``transition_letter``); its frozen entries row is never
-    rewritten.
+    rewritten. ``for_dad`` rides to the verbs (see ``done_todo``).
     """
     if new_status not in STATUSES:
         raise ValueError("status must be one of: %s" % ", ".join(STATUSES))
@@ -1325,15 +1328,16 @@ def set_status(conn, entry_id, new_status, *, agent=None, reason=None,
     if row is None or row["kind"] != "todo":
         return False
     if new_status == "open":
-        release_todo(conn, entry_id, agent=agent, reason=reason or "")
+        release_todo(conn, entry_id, agent=agent, reason=reason or "",
+                     for_dad=for_dad)
     elif new_status == "taken":
         take_todo(conn, entry_id, agent=agent, force=force)
     elif new_status == "done":
         done_todo(conn, entry_id, agent=agent, result=result,
-                  commit_sha=commit_sha, force=force)
+                  commit_sha=commit_sha, force=force, for_dad=for_dad)
     else:
         abandon_todo(conn, entry_id, agent=agent, reason=reason or "",
-                     force=force)
+                     force=force, for_dad=for_dad)
     return True
 
 
@@ -1445,13 +1449,15 @@ def _declared(origin):
             if isinstance(origin.get(key), str) and origin[key].strip()}
 
 
-def release_todo(conn, entry_id, *, agent=None, reason, evidence=None):
+def release_todo(conn, entry_id, *, agent=None, reason, evidence=None,
+                 for_dad=None):
     """``taken → open`` with a recorded reason; returns the row.
 
     Coop Quest "lifecycles-and-the-first-close": there is no auto-reap. A
     stale take is shown ("[taken by X, Nh ago]") and released only by a
     named decision — the taker, BJT or the chief — with a reason, through
-    this verb, and the event log keeps who decided.
+    this verb, and the event log keeps who decided. ``for_dad`` is Dad's
+    Korean lines, carried to the office (see ``done_todo``).
     """
     actor = require_canonical_identity(agent or detect_agent())
     text = (reason or "").strip()
@@ -1523,7 +1529,7 @@ def _amend_outcome(conn, kind, row, *, result_summary, commit_sha, actor):
 
 
 def done_todo(conn, entry_id, *, agent=None, result=None, commit_sha=None,
-              force=False, evidence=None, reply_outcomes=None):
+              force=False, evidence=None, reply_outcomes=None, for_dad=None):
     """Close a todo as done; the first close is the record.
 
     Coop Quest "lifecycles-and-the-first-close": ``open → done`` is the
@@ -1540,6 +1546,12 @@ def done_todo(conn, entry_id, *, agent=None, result=None, commit_sha=None,
     Quest "every-reply-answered": "답은 네 영수증에 붙어 저장되고"); the
     domain stores them in the ``done`` event, the office's engine validates
     them against the thread when the todo is bound.
+
+    ``for_dad`` is what Dad reads of the close — "아빠한테 쓰는 한국어 두세
+    줄, 많아야 네 줄" (Master Chief "the-worker-and-its-report") — carried
+    through the office's engine, which requires it when the close reports
+    taken work and writes his row (its ``_dad_line``); the domain itself
+    writes no row for Dad and keeps the English ``result`` as the record.
 
     Returns ``{"todo": row, "changed": bool, "amended": [fields],
     "letters": [ids]}`` — the ids are the live letters that mention
@@ -1621,13 +1633,14 @@ def done_todo(conn, entry_id, *, agent=None, result=None, commit_sha=None,
 
 
 def abandon_todo(conn, entry_id, *, agent=None, reason, force=False,
-                 evidence=None):
+                 evidence=None, for_dad=None):
     """``open | taken → abandoned``: the terminal give-up, with a reason.
 
     Coop Quest "lifecycles-and-the-first-close": the taker abandons; anyone
     else needs ``force``. A done todo is never abandoned — its first close
     is the record (amend the outcome instead) — and an abandoned one stays
-    abandoned unless BJT forces it done.
+    abandoned unless BJT forces it done. ``for_dad`` is Dad's Korean lines,
+    carried to the office (see ``done_todo``).
     """
     actor = require_canonical_identity(agent or detect_agent())
     text = (reason or "").strip()
@@ -2663,8 +2676,10 @@ def claim_message(conn, message_id, agent, origin=None):
         raise
 
 
-def release_message(conn, message_id, agent):
-    """Release one's own claim; True if the message went back to open."""
+def release_message(conn, message_id, agent, for_dad=None):
+    """Release one's own claim; True if the message went back to open.
+    ``for_dad`` is Dad's Korean lines, carried to the office (see
+    ``done_todo``), which requires them when the release reports a claim."""
     require_canonical_identity(agent)
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -2685,7 +2700,10 @@ def release_message(conn, message_id, agent):
         raise
 
 
-def finish_message(conn, message_id, agent, status="done"):
+def finish_message(conn, message_id, agent, status="done", for_dad=None):
+    """Finish a message one is part of, as ``done`` or ``superseded``.
+    ``for_dad`` is Dad's Korean lines, carried to the office (see
+    ``done_todo``), which requires them when the finish reports a claim."""
     if status not in ("done", "superseded"):
         raise ValueError("finished message status must be done or superseded")
     require_canonical_identity(agent)
@@ -3067,9 +3085,9 @@ def _owed_line(row, entry_id):
     owed = row["obligation"] if "obligation" in row.keys() else None
     if not owed:
         return ""
-    return ("  owes an outcome by %s — your own done/release/abandon (reply or"
-            " message-done for a claim) is its report; otherwise the chief reviews"
-            " #%d then" % (owed["due_at"], entry_id))
+    return ("  owes an outcome by %s — your own done/release/abandon --for-dad"
+            " \"…\" (reply or message-done for a claim) is its report; otherwise"
+            " the chief reviews #%d then" % (owed["due_at"], entry_id))
 
 
 def cmd_status(args):
@@ -3083,6 +3101,7 @@ def cmd_status(args):
     """
     agent = detect_agent(getattr(args, "agent", None))
     force = bool(getattr(args, "force", False))
+    dad = read_body(getattr(args, "for_dad", None))
     conn = connect()
     try:
         if args.cmd == "done":
@@ -3091,6 +3110,7 @@ def cmd_status(args):
                 commit_sha=args.sha, force=force,
                 reply_outcomes=[_parse_reply_outcome(text)
                                 for text in (getattr(args, "reply_outcome", None) or [])],
+                for_dad=dad,
             )
             if outcome["amended"]:
                 print("coop #%d is already done — amended %s (an `edit` event;"
@@ -3113,16 +3133,18 @@ def cmd_status(args):
             if _owed_line(row, args.id):
                 print(_owed_line(row, args.id))
         elif args.cmd == "release":
-            release_todo(conn, args.id, agent=agent, reason=args.reason)
+            release_todo(conn, args.id, agent=agent, reason=args.reason,
+                         for_dad=dad)
             print("coop #%d -> open (released)" % args.id)
         elif args.cmd == "abandon":
             abandon_todo(conn, args.id, agent=agent, reason=args.reason,
-                         force=force)
+                         force=force, for_dad=dad)
             print("coop #%d -> abandoned" % args.id)
         else:
             changed = set_status(
                 conn, args.id, args.status, agent=agent, reason=args.reason,
                 result=args.result, commit_sha=args.sha, force=force,
+                for_dad=dad,
             )
             if not changed:
                 sys.exit(_not_a_todo(conn, args.id))
@@ -3502,7 +3524,9 @@ def cmd_message_release(args):
     agent = detect_agent(args.agent)
     conn = connect()
     try:
-        changed = release_message(conn, args.id, agent)
+        changed = release_message(conn, args.id, agent, for_dad=read_body(args.for_dad))
+    except ValueError as exc:
+        sys.exit(str(exc))
     finally:
         conn.close()
     if not changed:
@@ -3560,7 +3584,8 @@ def cmd_message_done(args):
     agent = detect_agent(args.agent)
     conn = connect()
     try:
-        finish_message(conn, args.id, agent, status=args.status)
+        finish_message(conn, args.id, agent, status=args.status,
+                       for_dad=read_body(args.for_dad))
     except ValueError as exc:
         sys.exit(str(exc))
     finally:
@@ -3846,7 +3871,16 @@ def main(argv=None):
     # The todo lifecycle (Coop Quest "lifecycles-and-the-first-close"):
     # open → taken → done | abandoned, release back to open, and the fast
     # path `done` on an open todo. `status` is the legacy door routed to
-    # the same verbs.
+    # the same verbs. A close of taken work reports to Dad, who reads two
+    # or three Korean lines of it (Master Chief "the-worker-and-its-report"),
+    # so the closing verbs carry `--for-dad`; the office requires it there.
+    def add_for_dad(s):
+        s.add_argument("--for-dad", metavar="LINES",
+                       help="two or three Korean lines to Dad, at most four (cut"
+                            " at 1,200 characters): what was done, where it"
+                            " landed, whether he must act; required when the"
+                            " close reports taken work; '-' reads stdin")
+
     s = sub.add_parser("take", help="open → taken (your name on it)")
     s.add_argument("id", type=int)
     s.add_argument("--force", action="store_true",
@@ -3856,6 +3890,7 @@ def main(argv=None):
     s.add_argument("id", type=int)
     s.add_argument("--reason", required=True,
                    help="why the take is released (a named decision)")
+    add_for_dad(s)
     s.add_argument("--agent")
     s = sub.add_parser("done", help="open|taken → done; again: amend the outcome")
     s.add_argument("id", type=int)
@@ -3869,12 +3904,14 @@ def main(argv=None):
     s.add_argument("--force", action="store_true",
                    help="close someone else's take, or record an abandoned"
                         " todo done (BJT's call; the event keeps the reversal)")
+    add_for_dad(s)
     s.add_argument("--agent")
     s = sub.add_parser("abandon", help="open|taken → abandoned, with a reason")
     s.add_argument("id", type=int)
     s.add_argument("--reason", required=True, help="why the work is given up")
     s.add_argument("--force", action="store_true",
                    help="abandon someone else's take")
+    add_for_dad(s)
     s.add_argument("--agent")
     s = sub.add_parser("status", help="legacy door to the same verbs")
     s.add_argument("id", type=int)
@@ -3883,6 +3920,7 @@ def main(argv=None):
     s.add_argument("--result")
     s.add_argument("--sha")
     s.add_argument("--force", action="store_true")
+    add_for_dad(s)
     s.add_argument("--agent")
     s = sub.add_parser("events", help="the append-only transition log of one id")
     s.add_argument("id", type=int)
@@ -3940,6 +3978,7 @@ def main(argv=None):
 
     s = sub.add_parser("message-release")
     s.add_argument("id", type=int)
+    add_for_dad(s)
     s.add_argument("--agent")
 
     s = sub.add_parser("reply")
@@ -3953,6 +3992,7 @@ def main(argv=None):
     s = sub.add_parser("message-done")
     s.add_argument("id", type=int)
     s.add_argument("--status", choices=("done", "superseded"), default="done")
+    add_for_dad(s)
     s.add_argument("--agent")
 
     args = p.parse_args(argv)
