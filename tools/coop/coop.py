@@ -1544,6 +1544,53 @@ def _amend_outcome(conn, kind, row, *, result_summary, commit_sha, actor):
     return fields
 
 
+def _settle_finished_messages(conn, *, actor, verb, todo_id=None):
+    """Settle proven work threads inside the caller's close/start transaction.
+
+    Our messages merge Quest requests and replies. Applying L31's envelope
+    rule to these rows is the Chief's adaptation: superseded means work-over,
+    not that a reply was read or answered (L25). No outcome is fabricated.
+    office_work is the durable link; prose, subjects and dispatch age are not.
+    Ambiguous shared threads and broken/cross-thread reply chains stay open.
+    A standalone legacy ledger without office_work has no proven links.
+    """
+    if not conn.in_transaction:
+        raise RuntimeError("message settlement needs the close/start transaction")
+    actor = require_canonical_identity(actor)
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='office_work'"
+    ).fetchone():
+        return []
+    candidates = conn.execute(
+        "WITH RECURSIVE linked(todo_id,root_id,thread_id,message_id) AS ("
+        " SELECT w.item_id,m.id,m.thread_id,m.id FROM office_work w"
+        " JOIN entries e ON e.id=w.item_id JOIN messages m ON m.id=w.message_id"
+        " WHERE e.kind='todo' AND e.status IN ('done','abandoned')"
+        " AND (? IS NULL OR e.id=?) AND NOT EXISTS ("
+        " SELECT 1 FROM office_work other JOIN messages r ON r.id=other.message_id"
+        " WHERE r.thread_id=m.thread_id AND other.item_id!=w.item_id)"
+        " UNION SELECT l.todo_id,l.root_id,l.thread_id,m.id FROM linked l"
+        " JOIN messages m ON m.reply_to=l.message_id AND m.thread_id=l.thread_id)"
+        " SELECT m.*,l.todo_id,l.root_id FROM linked l"
+        " JOIN messages m ON m.id=l.message_id"
+        " WHERE m.status IN ('open','claimed') ORDER BY m.id",
+        (todo_id, todo_id),
+    ).fetchall()
+    stamp = now_iso()
+    for row in candidates:
+        conn.execute(
+            "UPDATE messages SET status='superseded',claimed_by='',updated_at=?"
+            " WHERE id=? AND status IN ('open','claimed')", (stamp, row["id"]),
+        )
+        _record_event(
+            conn, "message", row["id"], "supersede", actor,
+            from_status=row["status"], to_status="superseded", reason="work-over",
+            payload={"todo_id": row["todo_id"], "verb": verb,
+                     "root_message_id": row["root_id"]},
+        )
+    return [row["id"] for row in candidates]
+
+
 def done_todo(conn, entry_id, *, agent=None, result=None, commit_sha=None,
               force=False, evidence=None, reply_outcomes=None, for_dad=None):
     """Close a todo as done; the first close is the record.
@@ -1637,6 +1684,7 @@ def done_todo(conn, entry_id, *, agent=None, result=None, commit_sha=None,
                 payload=payload or None,
             )
             changed = True
+        _settle_finished_messages(conn, actor=actor, verb="done", todo_id=entry_id)
         letters = _letters_mentioning(conn, entry_id)
         conn.commit()
     except Exception:
@@ -1699,6 +1747,7 @@ def abandon_todo(conn, entry_id, *, agent=None, reason, force=False,
             from_status=row["status"], to_status="abandoned", reason=text,
             payload=payload or None,
         )
+        _settle_finished_messages(conn, actor=actor, verb="abandon", todo_id=entry_id)
         conn.commit()
         return get_entry(conn, entry_id)
     except Exception:
