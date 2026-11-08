@@ -1593,7 +1593,8 @@ def _settle_finished_messages(conn, *, actor, verb, todo_id=None, left_open=None
     A standalone legacy ledger without office_work has no proven links.
     Only the root worker's mailbox is ours to settle. L03 preserves the
     first close; L26 keeps post-close conversations deliverable. Unknown
-    close times or envelope links stay open, listed in left_open if supplied.
+    close times use the stricter post-close carrier test. Exclusions are
+    listed in left_open if supplied.
     """
     if not conn.in_transaction:
         raise RuntimeError("message settlement needs the close/start transaction")
@@ -1628,11 +1629,9 @@ def _settle_finished_messages(conn, *, actor, verb, todo_id=None, left_open=None
         reason = None
         if row["recipient_agent"] != row["recipient"]:
             reason = "different-recipient"
-        elif row["close_day"] is None:
-            reason = "unproven-close-time"
-        elif row["message_day"] is None:
+        elif row["close_day"] is not None and row["message_day"] is None:
             reason = "unproven-message-time"
-        elif row["message_day"] > row["close_day"]:
+        elif row["close_day"] is None or row["message_day"] > row["close_day"]:
             states = _message_envelope_states(conn, row["todo_id"], row["id"])
             if states is None:
                 reason = "unproven-envelope-link"
@@ -1652,7 +1651,8 @@ def _settle_finished_messages(conn, *, actor, verb, todo_id=None, left_open=None
             conn, "message", row["id"], "supersede", actor,
             from_status=row["status"], to_status="superseded", reason="work-over",
             payload={"todo_id": row["todo_id"], "verb": verb,
-                     "root_message_id": row["root_id"]},
+                     "root_message_id": row["root_id"],
+                     **({"close_time": "unproven"} if row["close_day"] is None else {})},
         )
         settled.append(row["id"])
     return settled
