@@ -172,7 +172,7 @@ HANDOFF_STEMS = (
     "handoff", "handover", "session-notes", "session-state",
     "new-session-reminder", "context-dump",
 )
-COOP_SCHEMA_VERSION = 5
+COOP_SCHEMA_VERSION = 6
 BRIEF_ITEM_LIMIT = 10
 # Settled client receipt files (committed / rejected) are deleted after a
 # day, checked at most hourly; uncertain ones stay until reconciled (Coop
@@ -647,6 +647,15 @@ def _migrate_schema(conn):
                 " ON entries(project, slug) WHERE kind='history'"
             )
             conn.execute("PRAGMA user_version=5")
+        if current < 6:
+            # Master Chief `the-coop-tool-and-a-direct-request` (2026-11-08,
+            # BJT "퀘스트대로"): "`add`는 그 자체로 읽히는 투두를 만들어. 범위,
+            # 제목, 본문, 우선순위." One additive column with a default, so a
+            # v5 client's INSERT list still fits; a rollback is only
+            # `PRAGMA user_version=5`.
+            if "priority" not in _table_columns(conn, "entries"):
+                conn.execute("ALTER TABLE entries ADD COLUMN priority TEXT NOT NULL DEFAULT ''")
+            conn.execute("PRAGMA user_version=6")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -781,51 +790,50 @@ def connect(path=None, *, _office_writer=False):
         raise _satellite_refusal(db_path)
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     conn = sqlite3.connect(db_path, factory=CoopConnection)
-    conn.db_path = db_path
-    conn.office_writer = _office_writer
-    conn.row_factory = sqlite3.Row
-    owned = owner_path(db_path).exists() or conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE name='coop_office' AND type='table'",
-    ).fetchone() is not None
-    conn.office_owned = owned
-    if satellite and not owned:
-        conn.close()
-        raise _satellite_refusal(db_path)
-    # Every protected row mutation, including a statement prepared before
-    # cutover, must resolve this function on THAT connection. Legacy clients
-    # have no such function and SQLite rejects their write.
-    conn.create_function("coop_writer_authorized", 0,
-        lambda: int(conn.office_writer and (not canonical or is_local_office_owner())))
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
-    if owned and not _office_writer:
-        conn.execute("PRAGMA query_only=ON")
-        FTS_OK = conn.execute(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' "
-            "AND name IN ('entries_fts','learning_entries_fts')",
-        ).fetchone()[0] == 2
-        return conn
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=5000")
     try:
+        conn.db_path = db_path
+        conn.office_writer = _office_writer
+        conn.row_factory = sqlite3.Row
+        owned = owner_path(db_path).exists() or conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='coop_office' AND type='table'",
+        ).fetchone() is not None
+        conn.office_owned = owned
+        if satellite and not owned:
+            raise _satellite_refusal(db_path)
+        # Every protected row mutation, including a statement prepared before
+        # cutover, must resolve this function on THAT connection. Legacy clients
+        # have no such function and SQLite rejects their write.
+        conn.create_function("coop_writer_authorized", 0,
+            lambda: int(conn.office_writer and (not canonical or is_local_office_owner())))
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        if owned and not _office_writer:
+            conn.execute("PRAGMA query_only=ON")
+            FTS_OK = conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' "
+                "AND name IN ('entries_fts','learning_entries_fts')",
+            ).fetchone()[0] == 2
+            return conn
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         # Tables must exist before a versionless DB can be introspected, while
         # indexes must wait until migrations have supplied every referenced
         # column.
         conn.executescript(_TABLE_SCHEMA)
         _migrate_schema(conn)
         conn.executescript(_INDEX_SCHEMA)
-    except Exception:
+        try:  # FTS5 ships with macOS/homebrew sqlite; degrade to LIKE search without it
+            _ensure_fts_index(conn, "entries_fts", _FTS_SCHEMA)
+            _ensure_fts_index(conn, "learning_entries_fts", _LEARNING_FTS_SCHEMA)
+            FTS_OK = True
+        except sqlite3.OperationalError:
+            FTS_OK = False
+        _migrate_legacy_reviews(conn)
+        return conn
+    except BaseException:
         conn.close()
         raise
-    try:  # FTS5 ships with macOS/homebrew sqlite; degrade to LIKE search without it
-        _ensure_fts_index(conn, "entries_fts", _FTS_SCHEMA)
-        _ensure_fts_index(conn, "learning_entries_fts", _LEARNING_FTS_SCHEMA)
-        FTS_OK = True
-    except sqlite3.OperationalError:
-        FTS_OK = False
-    _migrate_legacy_reviews(conn)
-    return conn
 
 
 # ---------------------------------------------------------------- context
@@ -1218,7 +1226,8 @@ def event_payload(row):
 
 
 def add_entry(conn, kind, title, body="", project=None, agent=None,
-              machine=None, slug=None, commit_sha=None, assignee=None):
+              machine=None, slug=None, commit_sha=None, assignee=None,
+              priority=None):
     """Insert one entry; returns (id, slug).
 
     Memory L6 ordering: a history/learning entry is written BEFORE its git
@@ -1245,6 +1254,13 @@ def add_entry(conn, kind, title, body="", project=None, agent=None,
         raise ValueError("kind must be one of: %s" % ", ".join(ENTRY_KINDS))
     if assignee is not None and kind != "todo":
         raise ValueError("only a todo has an assignee")
+    # MC `the-coop-tool-and-a-direct-request`: a todo's fourth field is its
+    # priority, a short word of the writer's (the lesson names no scale).
+    if priority is not None and kind != "todo":
+        raise ValueError("only a todo has a priority")
+    final_priority = (priority or "").strip() if kind == "todo" else ""
+    if len(final_priority) > 24:
+        raise ValueError("priority is a short word (at most 24 characters)")
     created = now_iso()
     author = require_canonical_identity(agent or detect_agent())
     status = "open" if kind == "todo" else ""
@@ -1256,11 +1272,11 @@ def add_entry(conn, kind, title, body="", project=None, agent=None,
     try:
         cur = conn.execute(
             "INSERT INTO entries (kind, project, agent, machine, title, body, slug, status,"
-            " commit_sha, assignee, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " commit_sha, assignee, priority, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (kind, scope, author,
              machine or detect_machine(), title, body or "", final_slug, status,
-             commit_sha or "", final_assignee, created, created),
+             commit_sha or "", final_assignee, final_priority, created, created),
         )
     except sqlite3.IntegrityError as exc:
         # history (project, slug) is unique since schema v5; a failed INSERT
@@ -2957,6 +2973,9 @@ def cmd_add(args, kind):
             project=args.project, agent=args.agent, slug=args.slug,
             commit_sha=getattr(args, "sha", None),
             assignee=getattr(args, "assignee", None),
+            # Sent only when given, so an office still on schema v5 (no
+            # `priority` argument) keeps taking this client's other writes.
+            **({"priority": args.priority} if getattr(args, "priority", None) else {}),
         )
         row = get_entry(conn, entry_id)
     except ValueError as exc:
@@ -3783,6 +3802,7 @@ def main(argv=None):
                            "(machine writers / retroactive records)")
         if name == "todo":
             s.add_argument("--assignee", help="who should do it (default: you)")
+            s.add_argument("--priority", help="a short word for its priority (MC L26)")
         return s
 
     for name in ("log", "todo"):
@@ -4280,6 +4300,10 @@ def _office_writer(fn):
                 if fn.__name__ == "read_letters" and key == "project":
                     continue
                 params[key] = default()
+        # Schema v6's `priority` is sent only when given: an office still on
+        # v5 knows no such argument, and absent means none on a v6 office.
+        if params.get("priority") is None:
+            params.pop("priority", None)
         return office_call(fn.__name__, params, path=conn.db_path)
     return routed
 

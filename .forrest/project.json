@@ -23,9 +23,9 @@
       ".forrest/session_start.py": "158341b1850843aea6de265d8807f241d683d8fe8776d8bb8039457ac43815f6",
       "AGENTS.md": "c992f7be0138390d39f40cd4f73a458bc97f4566a3c487e2d8ba5c3da4eebb3c",
       "CLAUDE.md": "4641fe2446dbff0b63136798b5835a2610de0e3a83133ae4dda8392d22fcbd69",
-      "tools/coop/coop.py": "8c137ceb12a0856056556dfc256f16c54a78d26c232a3677686431770d441f59",
+      "tools/coop/coop.py": "e8192726bf10ef5069244de0d9aa04d7cd4b9c7e01f35b2912c7454d5deebfc3",
       "tools/coop/family-ledger.json": "d8b103e1763ce5b46ec4e42ca1276117c1e01ef5620b67d0a4c4a6f84783c1ef",
-      "tools/coop/manifest.json": "9571640feb5581ea3aeb5a21b6ff26c3551847a01642d731447084fb0ac9da79"
+      "tools/coop/manifest.json": "d6ab9f4fb29bf997a66a5743262c0ba0e5a0604619dd2b8d090116c4dcc2b8ac"
     },
     "guard_hashes": {
       ".claude/settings.json": "68d83509b28d1832272e789f69c2099c1105f5d0a68afa2cd82643bbe59cfc75",
@@ -33,9 +33,9 @@
       ".forrest/session_start.py": "158341b1850843aea6de265d8807f241d683d8fe8776d8bb8039457ac43815f6",
       "AGENTS.md": "f5d97f9271113902d7cee0778669a3b58d7d32f29075182ab5424fcafebefeeb",
       "CLAUDE.md": "0227535bcdc951a736393b1cbd0a141ad33aa2d2eba421f941e2f00dabc77265",
-      "tools/coop/coop.py": "8c137ceb12a0856056556dfc256f16c54a78d26c232a3677686431770d441f59",
+      "tools/coop/coop.py": "e8192726bf10ef5069244de0d9aa04d7cd4b9c7e01f35b2912c7454d5deebfc3",
       "tools/coop/family-ledger.json": "d8b103e1763ce5b46ec4e42ca1276117c1e01ef5620b67d0a4c4a6f84783c1ef",
-      "tools/coop/manifest.json": "9571640feb5581ea3aeb5a21b6ff26c3551847a01642d731447084fb0ac9da79"
+      "tools/coop/manifest.json": "d6ab9f4fb29bf997a66a5743262c0ba0e5a0604619dd2b8d090116c4dcc2b8ac"
     },
     "scaffold_hashes": {
       "PROJECT_BRIEF.md": "cc7b996cecf6b7377b5459f9477fd85cb25f3d02d05c7eee48381fac16da28c4"
