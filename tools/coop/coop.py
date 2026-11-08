@@ -1544,7 +1544,45 @@ def _amend_outcome(conn, kind, row, *, result_summary, commit_sha, actor):
     return fields
 
 
-def _settle_finished_messages(conn, *, actor, verb, todo_id=None):
+def _message_envelope_states(conn, todo_id, message_id):
+    """Prove all carriers from dispatch payloads; None means no safe proof.
+
+    Followups carry message_id; task/reply_review contracts carry reply_ids
+    and replies; invitations carry reply_review.replies. Inspect every
+    generation, including a replacement envelope after an explicit resend.
+    A malformed payload on this work cannot prove absence of another carrier.
+    """
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    if not {"office_envelopes", "office_dispatches"} <= tables:
+        return None
+    states = []
+    for envelope in conn.execute(
+        "SELECT e.kind,e.payload,e.state FROM office_envelopes e"
+        " JOIN office_dispatches d ON d.id=e.dispatch_id WHERE d.item_id=?",
+        (todo_id,),
+    ):
+        try:
+            payload = json.loads(envelope["payload"])
+            if envelope["kind"] == "followup":
+                ids = [payload["message_id"]]
+            else:
+                if envelope["kind"] == "invitation":
+                    payload = payload.get("reply_review", {})
+                elif envelope["kind"] not in ("task", "reply_review"):
+                    return None
+                ids = payload.get("reply_ids", []) + [r["id"] for r in payload.get("replies", [])]
+            if any(type(mid) is not int for mid in ids):
+                return None
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return None
+        if message_id in ids:
+            states.append(envelope["state"])
+    return states or None
+
+
+def _settle_finished_messages(conn, *, actor, verb, todo_id=None, left_open=None):
     """Settle proven work threads inside the caller's close/start transaction.
 
     Our messages merge Quest requests and replies. Applying L31's envelope
@@ -1553,6 +1591,9 @@ def _settle_finished_messages(conn, *, actor, verb, todo_id=None):
     office_work is the durable link; prose, subjects and dispatch age are not.
     Ambiguous shared threads and broken/cross-thread reply chains stay open.
     A standalone legacy ledger without office_work has no proven links.
+    Only the root worker's mailbox is ours to settle. L03 preserves the
+    first close; L26 keeps post-close conversations deliverable. Unknown
+    close times or envelope links stay open, listed in left_open if supplied.
     """
     if not conn.in_transaction:
         raise RuntimeError("message settlement needs the close/start transaction")
@@ -1562,22 +1603,47 @@ def _settle_finished_messages(conn, *, actor, verb, todo_id=None):
     ).fetchone():
         return []
     candidates = conn.execute(
-        "WITH RECURSIVE linked(todo_id,root_id,thread_id,message_id) AS ("
-        " SELECT w.item_id,m.id,m.thread_id,m.id FROM office_work w"
+        "WITH RECURSIVE linked(todo_id,root_id,thread_id,recipient,closed_at,message_id) AS ("
+        " SELECT w.item_id,m.id,m.thread_id,m.recipient_agent,"
+        " COALESCE(NULLIF(e.closed_at,''),(SELECT at FROM coop_events c"
+        " WHERE c.kind='todo' AND c.entry_id=e.id"
+        " AND c.to_status IN ('done','abandoned') AND c.from_status!=c.to_status"
+        " ORDER BY c.id LIMIT 1)),m.id FROM office_work w"
         " JOIN entries e ON e.id=w.item_id JOIN messages m ON m.id=w.message_id"
         " WHERE e.kind='todo' AND e.status IN ('done','abandoned')"
         " AND (? IS NULL OR e.id=?) AND NOT EXISTS ("
         " SELECT 1 FROM office_work other JOIN messages r ON r.id=other.message_id"
         " WHERE r.thread_id=m.thread_id AND other.item_id!=w.item_id)"
-        " UNION SELECT l.todo_id,l.root_id,l.thread_id,m.id FROM linked l"
+        " UNION SELECT l.todo_id,l.root_id,l.thread_id,l.recipient,l.closed_at,m.id FROM linked l"
         " JOIN messages m ON m.reply_to=l.message_id AND m.thread_id=l.thread_id)"
-        " SELECT m.*,l.todo_id,l.root_id FROM linked l"
+        " SELECT m.*,l.todo_id,l.root_id,l.recipient,"
+        " julianday(l.closed_at) AS close_day,julianday(m.created_at) AS message_day FROM linked l"
         " JOIN messages m ON m.id=l.message_id"
         " WHERE m.status IN ('open','claimed') ORDER BY m.id",
         (todo_id, todo_id),
     ).fetchall()
     stamp = now_iso()
+    settled = []
     for row in candidates:
+        reason = None
+        if row["recipient_agent"] != row["recipient"]:
+            reason = "different-recipient"
+        elif row["close_day"] is None:
+            reason = "unproven-close-time"
+        elif row["message_day"] is None:
+            reason = "unproven-message-time"
+        elif row["message_day"] > row["close_day"]:
+            states = _message_envelope_states(conn, row["todo_id"], row["id"])
+            if states is None:
+                reason = "unproven-envelope-link"
+            # These are the terminal states used by dispatch.pending_envelopes.
+            # never_delivered is retryable in place and is deliberately absent.
+            elif any(state not in ("delivered", "processed", "settled", "withdrawn", "undelivered") for state in states):
+                reason = "deliverable-envelope"
+        if reason:
+            if left_open is not None:
+                left_open.append({"message_id": row["id"], "todo_id": row["todo_id"], "reason": reason})
+            continue
         conn.execute(
             "UPDATE messages SET status='superseded',claimed_by='',updated_at=?"
             " WHERE id=? AND status IN ('open','claimed')", (stamp, row["id"]),
@@ -1588,7 +1654,8 @@ def _settle_finished_messages(conn, *, actor, verb, todo_id=None):
             payload={"todo_id": row["todo_id"], "verb": verb,
                      "root_message_id": row["root_id"]},
         )
-    return [row["id"] for row in candidates]
+        settled.append(row["id"])
+    return settled
 
 
 def done_todo(conn, entry_id, *, agent=None, result=None, commit_sha=None,
@@ -1684,7 +1751,8 @@ def done_todo(conn, entry_id, *, agent=None, result=None, commit_sha=None,
                 payload=payload or None,
             )
             changed = True
-        _settle_finished_messages(conn, actor=actor, verb="done", todo_id=entry_id)
+        if changed:
+            _settle_finished_messages(conn, actor=actor, verb="done", todo_id=entry_id)
         letters = _letters_mentioning(conn, entry_id)
         conn.commit()
     except Exception:
