@@ -1596,8 +1596,9 @@ def _settle_finished_messages(conn, *, actor, verb, todo_id=None, left_open=None
     office_work is the durable link; prose, subjects and dispatch age are not.
     Ambiguous shared threads and broken/cross-thread reply chains stay open.
     A standalone legacy ledger without office_work has no proven links.
-    Only a dispatch worker mailbox matching the root is ours to settle.
-    A Chief, Soul or Dad take never makes that mailbox ours. L03 preserves the
+    Only a dispatch worker mailbox matching the root is ours to settle,
+    except the closing actor's own claimed root in this todo's close. A
+    Chief, Soul or Dad take never grants the rest of that mailbox. L03 preserves the
     first close; L26 keeps post-close conversations deliverable. Unknown
     close times use the stricter post-close carrier test. Exclusions are
     listed in left_open if supplied.
@@ -1637,6 +1638,11 @@ def _settle_finished_messages(conn, *, actor, verb, todo_id=None, left_open=None
     for row in candidates:
         reason = None
         carriers = None
+        own_root_close = (
+            todo_id == row["todo_id"] and verb in ("done", "abandon")
+            and row["id"] == row["root_id"] and row["status"] == "claimed"
+            and row["claimed_by"] == actor
+        )
         if has_obligations and conn.execute(
             "SELECT 1 FROM office_obligations WHERE message_id=? AND status!='closed'",
             (row["id"],),
@@ -1644,7 +1650,7 @@ def _settle_finished_messages(conn, *, actor, verb, todo_id=None, left_open=None
             reason = "owed-claim"
         elif row["recipient_agent"] != row["recipient"]:
             reason = "different-recipient"
-        elif row["recipient_agent"] not in DISPATCH_WORKER_MAILBOXES.values():
+        elif row["recipient_agent"] not in DISPATCH_WORKER_MAILBOXES.values() and not own_root_close:
             reason = "non-worker-recipient"
         elif row["close_day"] is not None and row["message_day"] is None:
             reason = "unproven-message-time"
