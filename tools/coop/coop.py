@@ -165,6 +165,11 @@ CANONICAL_AGENT_IDS = (
     "ollama-forrest",
     "forrest",
 )
+# Dispatch's receiver-to-mailbox mapping also bounds work-over settlement.
+# Keep it here so the standalone compatibility export uses the same source.
+DISPATCH_WORKER_MAILBOXES = {
+    "claude": "claude-code", "codex": "codex", "ollama": "ollama-forrest",
+}
 # The six handoff-document stems the letter checkpoint knows (Coop Quest
 # "a-letter-carries-itself"): a path-shaped mention is refused, a bare name
 # passes.
@@ -1545,7 +1550,7 @@ def _amend_outcome(conn, kind, row, *, result_summary, commit_sha, actor):
 
 
 def _message_envelope_states(conn, todo_id, message_id):
-    """Prove all carriers from dispatch payloads; None means no safe proof.
+    """Prove carrier kinds/states from payloads; None means no safe proof.
 
     Followups carry message_id; task/reply_review contracts carry reply_ids
     and replies; invitations carry reply_review.replies. Inspect every
@@ -1557,10 +1562,10 @@ def _message_envelope_states(conn, todo_id, message_id):
     )}
     if not {"office_envelopes", "office_dispatches"} <= tables:
         return None
-    states = []
+    carriers = []
     for envelope in conn.execute(
         "SELECT e.kind,e.payload,e.state FROM office_envelopes e"
-        " JOIN office_dispatches d ON d.id=e.dispatch_id WHERE d.item_id=?",
+        " JOIN office_dispatches d ON d.id=e.dispatch_id WHERE d.item_id=? ORDER BY e.rowid",
         (todo_id,),
     ):
         try:
@@ -1578,8 +1583,8 @@ def _message_envelope_states(conn, todo_id, message_id):
         except (ValueError, TypeError, KeyError, AttributeError):
             return None
         if message_id in ids:
-            states.append(envelope["state"])
-    return states or None
+            carriers.append({"kind": envelope["kind"], "state": envelope["state"]})
+    return carriers or None
 
 
 def _settle_finished_messages(conn, *, actor, verb, todo_id=None, left_open=None):
@@ -1591,7 +1596,8 @@ def _settle_finished_messages(conn, *, actor, verb, todo_id=None, left_open=None
     office_work is the durable link; prose, subjects and dispatch age are not.
     Ambiguous shared threads and broken/cross-thread reply chains stay open.
     A standalone legacy ledger without office_work has no proven links.
-    Only the root worker's mailbox is ours to settle. L03 preserves the
+    Only a dispatch worker mailbox matching the root is ours to settle.
+    A Chief, Soul or Dad take never makes that mailbox ours. L03 preserves the
     first close; L26 keeps post-close conversations deliverable. Unknown
     close times use the stricter post-close carrier test. Exclusions are
     listed in left_open if supplied.
@@ -1623,21 +1629,32 @@ def _settle_finished_messages(conn, *, actor, verb, todo_id=None, left_open=None
         " WHERE m.status IN ('open','claimed') ORDER BY m.id",
         (todo_id, todo_id),
     ).fetchall()
+    has_obligations = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='office_obligations'"
+    ).fetchone() is not None
     stamp = now_iso()
     settled = []
     for row in candidates:
         reason = None
-        if row["recipient_agent"] != row["recipient"]:
+        carriers = None
+        if has_obligations and conn.execute(
+            "SELECT 1 FROM office_obligations WHERE message_id=? AND status!='closed'",
+            (row["id"],),
+        ).fetchone():
+            reason = "owed-claim"
+        elif row["recipient_agent"] != row["recipient"]:
             reason = "different-recipient"
+        elif row["recipient_agent"] not in DISPATCH_WORKER_MAILBOXES.values():
+            reason = "non-worker-recipient"
         elif row["close_day"] is not None and row["message_day"] is None:
             reason = "unproven-message-time"
         elif row["close_day"] is None or row["message_day"] > row["close_day"]:
-            states = _message_envelope_states(conn, row["todo_id"], row["id"])
-            if states is None:
+            carriers = _message_envelope_states(conn, row["todo_id"], row["id"])
+            if carriers is None:
                 reason = "unproven-envelope-link"
             # These are the terminal states used by dispatch.pending_envelopes.
             # never_delivered is retryable in place and is deliberately absent.
-            elif any(state not in ("delivered", "processed", "settled", "withdrawn", "undelivered") for state in states):
+            elif any(carrier["state"] not in ("delivered", "processed", "settled", "withdrawn", "undelivered") for carrier in carriers):
                 reason = "deliverable-envelope"
         if reason:
             if left_open is not None:
@@ -1652,6 +1669,8 @@ def _settle_finished_messages(conn, *, actor, verb, todo_id=None, left_open=None
             from_status=row["status"], to_status="superseded", reason="work-over",
             payload={"todo_id": row["todo_id"], "verb": verb,
                      "root_message_id": row["root_id"],
+                     # Keep stored states verbatim: settled is not delivered.
+                     **({"carriers": carriers} if carriers is not None else {}),
                      **({"close_time": "unproven"} if row["close_day"] is None else {})},
         )
         settled.append(row["id"])
