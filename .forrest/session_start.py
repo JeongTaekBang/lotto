@@ -1,23 +1,40 @@
 #!/usr/bin/env python3
-"""Load the selected Forrest Soul into a Forrest terminal body.
+"""Open a Forrest terminal body: the Soul Vault identity card, then the body's context.
 
 The repository copy serves the general development body and is also vendored
 as ``.forrest/session_start.py`` in every registered repository. Claude Code
-and Codex run the appropriate copy at SessionStart. The identity itself is
-never copied into a repository: each run reads the selected Soul vault fresh,
-then adds only the body-specific context and the live Coop card.
+and Codex run the appropriate copy at SessionStart.
 
-The hook is deliberately fail-open. A broken optional identity note must not
-prevent a terminal from opening, while a missing soul entry, missing
-instructions file, an unusable existing core note, or unavailable Coop
-database is made conspicuous in the model-visible output.
+Identity has one source (Memory L14). The hook runs the Soul Vault client of
+the family's main checkout, ``soul-vault bootstrap --harness <agent> --soul
+<vault> --hook``, and prints what it prints: the identity card (the identity
+note whole, then the bundle to read in full before any task), or one refusal
+line, ``identity not loaded: <code>: <cause>``, with the instruction to stop.
+This file reads no vault note and holds no location of one, so a worktree, a
+WorkUnit clone or a registered repository cannot serve an older copy of the
+Soul, and no half of an identity is ever assembled here.
+
+The hook is not fail-open for identity. A client that is missing, cannot
+start, times out or prints nothing, and a session whose Soul the store cannot
+name, all end as that same refusal. A refusal is printed alone: no overlay
+that invites work, and no Coop letter is read, because reading marks a handoff
+letter read and a session that will stop must not consume one. The hook still
+exits 0: a harness may drop the output of a hook that failed, and the refusal
+is exactly the text the model must see.
+
+After a card the hook adds only what the body owns: the terminal-context
+header, the selected Soul's registry coordinates, a registered repository's
+project overlay, the Coop handoff letters and the live Coop card. Those parts
+stay fail-open and conspicuous (an unavailable Coop database is a warning in
+the model-visible output), and under a host's context limit they yield first.
+The card is never clipped or demoted.
 
 The bootstrap is a SessionStart product. Any other hook event exits silently
 and writes nothing: bundles 22-23 shipped a ``UserPromptSubmit`` hook for a
 terminal-session receipt that has had no reader since 2026-09-18, and Claude
 Code snapshots its hooks when a session opens, so a session older than bundle
 24 keeps calling this script on every prompt. Printing there would re-inject
-the whole identity into the model's context each turn.
+the card and the whole context into the model's context each turn.
 """
 
 from __future__ import annotations
@@ -37,13 +54,25 @@ import tempfile
 import time
 
 
-_IDENTITY_MAX_BYTES = 48 * 1024
 _PROJECT_BRIEF_MAX_BYTES = 16 * 1024
 _COOP_MAX_BYTES = 16 * 1024
-_SKIP_PREFIXES = ("_", ".")
 _RUNTIME_CONTEXT_FILENAME = "runtime-context.json"
 _RUNTIME_CONTEXT_SCHEMA_VERSION = 1
 _HOOK_PAYLOAD_MAX_BYTES = 1024 * 1024
+# The Soul Vault client of the family's main checkout, found the way the Coop
+# client finds the family ledger: an explicit path, else the checkout under
+# the home directory. Never the repository this script sits in.
+_SOUL_VAULT_CLIENT_ENV = "FORREST_SOUL_VAULT_CLIENT"
+_MAIN_CHECKOUT = ("bjtPersonalProjects", "bjtForrest")
+_CARD_FIRST_WORDS = "[Soul Vault] identity loaded:"
+_REFUSAL_FIRST_WORDS = "identity not loaded:"
+# A harness that kills a slow hook opens the session with no text at all,
+# neither card nor refusal. Codex gives this hook 30 seconds (.codex/hooks.json
+# here and in every registered repository), so the whole run stays inside 25
+# and the client's share inside 8: its two calls take about 0.2 seconds.
+_HOOK_DEADLINE_SECONDS = 25
+_IDENTITY_DEADLINE_SECONDS = 8
+_COOP_DEADLINE_SECONDS = 20
 # Claude Code keeps at most this many characters of SessionStart stdout in
 # context. Above it the whole output is written to a tool-results file and only
 # a 2,000-character preview reaches the model (observed on Claude Code 2.1.270,
@@ -63,7 +92,8 @@ _HOST_CONTEXT_MARGIN_CHARS = 200
 def _host_chars(text: str) -> int:
     """The host's count of ``text``: UTF-16 code units, as JavaScript's ``.length``."""
     return len(text.encode("utf-16-le")) // 2
-_DEMOTABLE_LABEL_PREFIXES = ("core/", "shared core/", "PROJECT_BRIEF.md")
+_DEMOTABLE_LABEL_PREFIX = "PROJECT_BRIEF.md"
+_CONTEXT_CLOSE = "</forrest-terminal-context>"
 _FORREST_PROTOCOL_BEGIN = "<!-- BEGIN:forrest-project-protocol -->"
 _FORREST_PROTOCOL_END = "<!-- END:forrest-project-protocol -->"
 _GUARDED_PATHS = (
@@ -396,159 +426,75 @@ def _profile_projection(
     return profile
 
 
-def _shared_root(value: object, warnings: list[str]) -> Path | None:
-    """Read a published shared owner without guessing from the Soul root."""
-    if value is None:
-        return None  # Additive descriptor field; older descriptors have none.
-    try:
-        if not isinstance(value, str) or not Path(value).is_absolute():
-            raise ValueError("expected an absolute shared vault path")
-        return Path(value).resolve()
-    except (OSError, RuntimeError, ValueError) as exc:
-        warnings.append(f"SHARED SOUL CORE ROOT UNAVAILABLE: {exc}")
-        return None
+class _IdentityRefused(Exception):
+    """Identity did not load.
 
-
-def _shared_instructions(
-    value: object,
-    shared_root: Path | None,
-    copied: str,
-    warnings: list[str],
-) -> str:
-    """Read the registry-wide template fresh; the published copy is a fallback.
-
-    Memory L5: the terminal host reads its bootstrap when it starts, so an
-    edit to the shared file reaches the next session without a backend
-    republish. The read passes the same owner check as the Soul vault.
+    Carries a code from Soul Vault's closed failure set with the observed
+    cause, or the client's own refusal text, which is passed on verbatim.
     """
-    if value is None:
-        # Additive descriptor field: an older backend published only the copy.
-        if not copied:
-            warnings.append(
-                "ACTIVE SHARED SOUL INSTRUCTIONS UNAVAILABLE: runtime "
-                "descriptor predates the shared projection."
-            )
-        return copied
-    fresh = ""
-    if (
-        isinstance(value, str)
-        and Path(value).is_absolute()
-        and shared_root is not None
-    ):
-        fresh = _read(Path(value), owner_root=shared_root)
-    if fresh:
-        return fresh
-    fallback = (
-        "using the copy the backend published."
-        if copied else "the backend published no copy."
-    )
-    reason = (
-        f"{value} could not be read inside {shared_root}"
-        if shared_root is not None
-        else f"no shared root was published to read {value} inside"
-    )
-    warnings.append(
-        f"ACTIVE SHARED SOUL INSTRUCTIONS UNAVAILABLE: {reason}; {fallback}"
-    )
-    return copied
+
+    def __init__(self, code: str = "", cause: object = "", *, said: str = "") -> None:
+        super().__init__(said or f"{code}: {cause}")
+        self.code = code
+        self.cause = " ".join(str(cause).split())
+        self.said = said
+
+    def text(self, agent: str) -> str:
+        """The whole refusal a session reads: one line, then the instruction to stop."""
+        if self.said:
+            return self.said if self.said.endswith("\n") else self.said + "\n"
+        # The words of the bundled client's ``render.refusal_text``. The hook
+        # says them only where the client could not: it is missing, it did not
+        # start, it did not answer, or it could not be asked for one Soul.
+        return (
+            f"{_REFUSAL_FIRST_WORDS} {self.code}: {self.cause}\n"
+            "\n"
+            f"STOP. The soul vault did not load for {agent}. Do not answer as "
+            "a generic assistant and do not invent an identity. Tell the owner exactly the line "
+            "above (in Korean if he speaks Korean), and do nothing else until he fixes it or "
+            "tells you otherwise.\n"
+        )
 
 
-def _identity_source() -> tuple[
-    Path,
-    Path | None,
-    dict[str, str] | None,
-    str | None,
-    Path | None,
-    str,
-    list[str],
-]:
-    """Resolve the same active identity pointers the WebUI backend published."""
-    # Managed project work belongs to the Soul fixed on its source
-    # conversation. The fenced supervisor pins these three values from the
-    # exact WorkUnit descriptor. They outrank the global runtime-context file,
-    # which describes only the default terminal surface.
-    work_root = os.environ.get("FORREST_WORK_SOUL_VAULT_ROOT", "").strip()
-    work_entry = os.environ.get("FORREST_WORK_SOUL_ENTRY", "").strip()
+def _selected_soul() -> tuple[dict[str, str] | None, str, list[str]]:
+    """The registry coordinates of the Soul this session is for, and who gave them.
+
+    Managed project work belongs to the Soul fixed on its source conversation.
+    The fenced supervisor pins that Soul from the exact WorkUnit descriptor,
+    and the pin outranks the runtime descriptor, which names only the default
+    terminal Soul. A pin without complete coordinates is refused: a WorkUnit
+    is never answered by the default Soul in its place.
+
+    An ordinary terminal still opens when the backend has published no
+    descriptor. Identity does not wait on a service; the missing coordinates
+    are a warning.
+    """
     work_soul_id = os.environ.get("FORREST_WORK_SOUL_ID", "").strip()
-    if work_root or work_entry or work_soul_id:
-        root = Path(work_root or ".").expanduser().resolve()
-        source = f"managed WorkUnit Soul {work_soul_id or '<missing>'}"
-        if not (work_root and work_entry and work_soul_id):
-            return root, None, None, None, None, source, [
-                "MANAGED WORKUNIT SOUL IDENTITY INCOMPLETE: refusing to mix "
-                "it with the global Soul.",
-            ]
-        entry = Path(work_entry).expanduser().resolve()
-        if entry != root and root not in entry.parents:
-            return root, None, None, None, None, source, [
-                "MANAGED WORKUNIT SOUL ENTRY ESCAPED ITS VAULT: identity "
-                "entry was not loaded.",
-            ]
-        profile = _profile_projection(
-            os.environ.get("FORREST_WORK_SOUL_PROFILE"),
-            expected_soul_id=work_soul_id,
+    work_profile = os.environ.get("FORREST_WORK_SOUL_PROFILE", "").strip()
+    if work_soul_id or work_profile:
+        profile = (
+            _profile_projection(work_profile, expected_soul_id=work_soul_id)
+            if work_soul_id
+            else None
         )
-        copied = os.environ.get("FORREST_WORK_SHARED_INSTRUCTIONS", "").strip()
-        work_warnings: list[str] = []
         if profile is None:
-            work_warnings.append(
-                "MANAGED WORKUNIT SOUL ROUTING UNAVAILABLE: registry routing "
-                "projection was not loaded."
+            raise _IdentityRefused(
+                "soul_not_found",
+                "this managed WorkUnit does not name its Soul completely (soul id "
+                f"{work_soul_id or 'missing'}, registry coordinates "
+                f"{'unreadable' if work_profile else 'missing'}); the default Soul is "
+                "not loaded in its place",
             )
-        shared_root = _shared_root(
-            os.environ.get("FORREST_WORK_SHARED_VAULT_ROOT"), work_warnings,
-        )
-        shared_path = os.environ.get("FORREST_WORK_SHARED_INSTRUCTIONS_PATH")
-        if shared_path is None and copied:
-            work_warnings.append(
-                "MANAGED WORKUNIT SHARED SOUL INSTRUCTIONS: legacy descriptor "
-                "has no live source path; using its published copy."
-            )
-        shared = _shared_instructions(
-            shared_path, shared_root, copied, work_warnings,
-        )
-        return root, entry, profile, shared or None, shared_root, source, work_warnings
+        return profile, f"managed WorkUnit Soul {work_soul_id}", []
 
     descriptor = _runtime_context_path()
-    warnings: list[str] = []
     try:
         payload = json.loads(descriptor.read_text(encoding="utf-8"))
-        raw_root = payload.get("vault_root") if isinstance(payload, dict) else None
-        raw_soul = payload.get("soul_entry") if isinstance(payload, dict) else None
-        raw_soul_id = payload.get("soul_id") if isinstance(payload, dict) else None
         if (
             not isinstance(payload, dict)
             or payload.get("schema_version") != _RUNTIME_CONTEXT_SCHEMA_VERSION
-            or not isinstance(raw_root, str)
-            or not raw_root.strip()
         ):
-            raise ValueError("unsupported or incomplete descriptor")
-        root = Path(raw_root).expanduser().resolve()
-        soul = (
-            Path(raw_soul).expanduser().resolve()
-            if isinstance(raw_soul, str) and raw_soul.strip()
-            else None
-        )
-        soul_id = raw_soul_id if isinstance(raw_soul_id, str) else None
-        profile = _profile_projection(
-            payload.get("soul_profile"),
-            expected_soul_id=soul_id,
-        )
-        shared_raw = payload.get("shared_instructions")
-        copied = shared_raw.strip() if isinstance(shared_raw, str) else ""
-        if profile is None:
-            warnings.append(
-                "ACTIVE SOUL ROUTING UNAVAILABLE: runtime descriptor predates "
-                "the canonical routing projection."
-            )
-        shared_root = _shared_root(payload.get("shared_vault_root"), warnings)
-        shared = _shared_instructions(
-            payload.get("shared_instructions_path"),
-            shared_root,
-            copied,
-            warnings,
-        )
-        return root, soul, profile, shared or None, shared_root, str(descriptor), warnings
+            raise ValueError("unsupported descriptor")
     except (
         FileNotFoundError,
         OSError,
@@ -556,71 +502,157 @@ def _identity_source() -> tuple[
         json.JSONDecodeError,
         ValueError,
     ) as exc:
-        warnings.append(
+        return None, str(descriptor), [
             "ACTIVE RUNTIME CONTEXT UNAVAILABLE: "
-            f"{descriptor} ({exc}). Terminal identity is using a fallback; "
-            "do not assume WebUI/terminal parity until the Forrest backend "
-            "publishes this descriptor."
-        )
-
-    raw = os.environ.get("FORREST_VAULT_ROOT", "").strip()
-    root = (
-        Path(raw).expanduser().resolve()
-        if raw
-        else (Path.home() / "Forrest").resolve()
+            f"{descriptor} ({exc}). The selected Soul's registry coordinates "
+            "are unknown until the Forrest backend publishes this descriptor."
+        ]
+    soul_id = payload.get("soul_id")
+    profile = _profile_projection(
+        payload.get("soul_profile"),
+        expected_soul_id=soul_id if isinstance(soul_id, str) else None,
     )
-    explicit_soul = os.environ.get("FORREST_SOUL_ENTRY", "").strip()
-    if explicit_soul:
-        configured = Path(explicit_soul).expanduser()
-        soul = (
-            configured.resolve()
-            if configured.is_absolute()
-            else (root / configured).resolve()
-        )
-    else:
-        soul = None
-    fallback = "FORREST_VAULT_ROOT" if raw else "default ~/Forrest"
-    return root, soul, None, None, None, fallback, warnings
+    if profile is None:
+        return None, str(descriptor), [
+            "ACTIVE SOUL ROUTING UNAVAILABLE: runtime descriptor predates "
+            "the canonical routing projection."
+        ]
+    return profile, str(descriptor), []
 
 
-def _soul_entry(root: Path, configured: Path | None = None) -> Path:
-    if configured is not None:
-        return configured
-    explicit = os.environ.get("FORREST_SOUL_ENTRY", "").strip()
+def _soul_vault_client() -> Path:
+    explicit = os.environ.get(_SOUL_VAULT_CLIENT_ENV, "").strip()
     if explicit:
-        configured = Path(explicit).expanduser()
-        return (
-            configured.resolve()
-            if configured.is_absolute()
-            else (root / configured).resolve()
+        return Path(explicit).expanduser()
+    return Path.home().joinpath(*_MAIN_CHECKOUT, "tools", "soul-vault")
+
+
+def _last_line(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _run_client(
+    client: Path, arguments: list[str], deadline: float,
+) -> subprocess.CompletedProcess[str]:
+    """Run the client once. Every way it cannot answer is a named refusal."""
+    if not client.is_file():
+        raise _IdentityRefused("service_unavailable", f"no Soul Vault client at {client}")
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired([str(client)], _IDENTITY_DEADLINE_SECONDS)
+        return subprocess.run(
+            [str(client), *arguments],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=remaining,
         )
-    candidates = list(dict.fromkeys((
-        root / f"{root.name}.md",
-        root / f"{root.name.casefold()}.md",
-        root / "soul.md",
-        root / "forrest.md",
-    )))
-    return next((path for path in candidates if path.is_file()), candidates[0])
+    except subprocess.TimeoutExpired:
+        raise _IdentityRefused(
+            "service_unavailable",
+            f"the Soul Vault client {client} did not answer within "
+            f"{_IDENTITY_DEADLINE_SECONDS} seconds",
+        ) from None
+    except OSError as exc:
+        raise _IdentityRefused(
+            "service_unavailable",
+            f"the Soul Vault client {client} could not start "
+            f"({type(exc).__name__}: {exc})",
+        ) from None
 
 
-def _owned_path(path: Path, root: Path) -> Path | None:
-    """Resolve a terminal identity path without crossing its Soul vault."""
+def _soul_vault(
+    client: Path, agent: str, selected: dict[str, str] | None, deadline: float,
+) -> str:
+    """The store's name for the selected Soul's vault, taken from data alone.
+
+    The client lists the souls its store holds (``health``). Nothing published
+    yet joins a registry ``soul_id`` to a vault name, so the rule is the one
+    that needs no join: the store's only soul vault, and only while it answers
+    to the selected Soul's registry display name. A store with several soul
+    vaults, and a session for a Soul that vault does not belong to (a guest,
+    a Soul the record does not hold), are refused by name. A name is never
+    answered from a neighbour's vault.
+    """
+    done = _run_client(client, ["health", "--harness", agent], deadline)
+    if done.returncode != 0:
+        said = _last_line(done.stderr)
+        code, separator, cause = said.partition(": ")
+        if separator and re.fullmatch(r"[a-z_]+", code):
+            raise _IdentityRefused(code, cause)  # the client's own named failure
+        raise _IdentityRefused(
+            "internal_error",
+            f"the Soul Vault client {client} could not list the store's souls "
+            f"(exit {done.returncode}{': ' + said if said else ''})",
+        )
     try:
-        owner = root.resolve()
-        resolved = path.resolve()
-    except (OSError, RuntimeError):
-        return None
-    if resolved != owner and owner not in resolved.parents:
-        return None
-    return resolved
+        souls = [
+            (str(soul["name"]), str(soul["display"]))
+            for soul in json.loads(done.stdout)["souls"]
+            if soul["kind"] == "soul"
+        ]
+    except (ValueError, KeyError, TypeError) as exc:
+        problem = (
+            f"{type(exc).__name__}: {exc}" if done.stdout.strip() else "it printed nothing"
+        )
+        raise _IdentityRefused(
+            "internal_error",
+            f"the list of souls from the Soul Vault client {client} could not be "
+            f"read ({problem})",
+        ) from None
+    who = (
+        f"Soul {selected['soul_id']} ({selected['display_name']})"
+        if selected is not None
+        else "the default Soul"
+    )
+    if len(souls) != 1:
+        names = ", ".join(name for name, _display in souls) or "none"
+        raise _IdentityRefused(
+            "soul_not_found",
+            f"the store holds {len(souls)} soul vaults ({names}), and nothing "
+            f"published says which one {who} owns",
+        )
+    name, display = souls[0]
+    if selected is not None and selected["display_name"] != display:
+        raise _IdentityRefused(
+            "soul_not_found",
+            f"this session is for {who}, and the store's only soul vault, {name}, "
+            f"answers to {display}; another Soul's identity is not loaded in its place",
+        )
+    return name
 
 
-def _read(path: Path, *, owner_root: Path | None = None) -> str:
-    read_path = _owned_path(path, owner_root) if owner_root is not None else path
-    if read_path is None:
-        return ""
+def _identity_card(agent: str) -> tuple[str, dict[str, str] | None, str, list[str]]:
+    """Load identity through the client, or raise the refusal. Nothing else.
+
+    Returns the card exactly as the client printed it, the selected Soul's
+    registry coordinates, where those came from, and warnings about them.
+    """
+    selected, source, warnings = _selected_soul()
+    client = _soul_vault_client()
+    deadline = time.monotonic() + _IDENTITY_DEADLINE_SECONDS
+    vault = _soul_vault(client, agent, selected, deadline)
+    done = _run_client(
+        client, ["bootstrap", "--harness", agent, "--soul", vault, "--hook"], deadline,
+    )
+    if done.stdout.startswith(_REFUSAL_FIRST_WORDS):
+        raise _IdentityRefused(said=done.stdout)
+    if done.returncode != 0 or not done.stdout.startswith(_CARD_FIRST_WORDS):
+        said = _last_line(done.stderr)
+        raise _IdentityRefused(
+            "internal_error",
+            f"the Soul Vault client {client} printed neither a card nor a refusal "
+            f"(exit {done.returncode}{': ' + said if said else ''})",
+        )
+    return done.stdout, selected, source, warnings
+
+
+def _read(path: Path) -> str:
     try:
-        return read_path.read_text(encoding="utf-8").strip()
+        return path.read_text(encoding="utf-8").strip()
     except (FileNotFoundError, OSError, UnicodeDecodeError):
         return ""
 
@@ -641,194 +673,6 @@ def _clip(text: str, max_bytes: int, *, source: Path | str) -> str:
     return clipped + notice.decode("utf-8")
 
 
-def _identity_sections(
-    root: Path,
-    configured_soul: Path | None = None,
-    profile: dict[str, str] | None = None,
-    shared_instructions: str | None = None,
-    shared_root: Path | None = None,
-) -> tuple[list[str], list[str]]:
-    entry = _soul_entry(root, configured_soul)
-    profile_body = "\n".join(
-        f"{key}: {profile.get(key, '')}"
-        for key in ("soul_id", "display_name")
-    ) if profile is not None else ""
-    candidates: list[tuple[str, str, str, str | None]] = [
-        (
-            f"{entry.name} — named soul entry",
-            str(entry),
-            _read(entry, owner_root=root),
-            f"CRITICAL: active soul entry is unavailable: {entry}",
-        ),
-        (
-            "Soul registry — canonical routing identity",
-            "runtime canonical registry projection",
-            profile_body,
-            "CRITICAL: active Soul registry routing is unavailable",
-        ),
-        (
-            "shared-instructions.md — registry-wide inheritance",
-            "runtime canonical shared-instructions projection",
-            (shared_instructions or "").strip(),
-            "CRITICAL: shared Soul instructions are unavailable",
-        ),
-    ]
-    core_warnings: list[str] = []
-    shared_start = len(candidates)
-    if shared_root is not None:
-        shared_candidates, shared_warnings = _core_candidates(
-            shared_root, kind="shared soul",
-        )
-        candidates.extend(shared_candidates)
-        core_warnings.extend(shared_warnings)
-    shared_end = len(candidates)
-    candidates.append((
-        "instructions.md — soul operational delta",
-        str(root / "instructions.md"),
-        _read(root / "instructions.md", owner_root=root),
-        "CRITICAL: active soul instructions are unavailable: "
-        f"{root / 'instructions.md'}",
-    ))
-    local_candidates, local_warnings = _core_candidates(root)
-    candidates.extend(local_candidates)
-    core_warnings.extend(local_warnings)
-
-    rendered_candidates = [
-        f"--- {label} ({source}) ---\n{body}" if body else ""
-        for label, source, body, _warning in candidates
-    ]
-    # Budget priority differs from inheritance order. Shared core may use
-    # only bytes left after the pre-existing Soul spine, while still appearing
-    # before its overrides. Counting a two-byte separator per section against
-    # budget + 2 also handles a missing entry/profile without an off-by-two.
-    spine_bytes = sum(
-        len(rendered.encode("utf-8")) + 2
-        for index, rendered in enumerate(rendered_candidates)
-        if rendered and not shared_start <= index < shared_end
-    )
-    shared_budget = max(0, _IDENTITY_MAX_BYTES + 2 - spine_bytes)
-    sections: list[str] = []
-    warnings: list[str] = core_warnings
-    used = 0
-    shared_omission_warned = False
-    for index, (label, source, body, missing_warning) in enumerate(candidates):
-        if not body:
-            if missing_warning is not None:
-                warnings.append(missing_warning)
-            continue
-        rendered = rendered_candidates[index]
-        is_shared = shared_start <= index < shared_end
-        separator_bytes = 2 if sections else 0
-        remaining = _IDENTITY_MAX_BYTES - used - separator_bytes
-        if is_shared:
-            remaining = min(remaining, shared_budget - 2)
-        if remaining <= 0:
-            if is_shared:
-                if not shared_omission_warned:
-                    warnings.append(
-                        "Shared core byte budget omitted file(s) to preserve "
-                        f"the Soul's own instructions/core; read {shared_root / 'core'} "
-                        "for the complete shared layer."
-                    )
-                    shared_omission_warned = True
-                continue
-            omitted = [
-                candidate_label
-                for candidate_label, _source, _body, _warning in candidates[index:]
-            ]
-            warnings.append(
-                "Identity byte budget omitted later file(s): "
-                + ", ".join(omitted[:8])
-                + (f" (+{len(omitted) - 8} more)" if len(omitted) > 8 else "")
-            )
-            break
-        bounded = _clip(rendered, remaining, source=source)
-        sections.append(bounded)
-        used += separator_bytes + len(bounded.encode("utf-8"))
-        if is_shared:
-            shared_budget -= len(bounded.encode("utf-8")) + 2
-            if bounded != rendered:
-                warnings.append(
-                    f"Shared core note bounded to preserve Soul overrides: {source}"
-                )
-            continue
-        if bounded != rendered:
-            omitted = [
-                candidate_label
-                for candidate_label, _source, _body, _warning
-                in candidates[index + 1:]
-            ]
-            if omitted:
-                warnings.append(
-                    "Identity byte budget omitted later file(s): "
-                    + ", ".join(omitted[:8])
-                    + (f" (+{len(omitted) - 8} more)" if len(omitted) > 8 else "")
-                )
-            break
-    return sections, warnings
-
-
-def _prompt_mode(text: str) -> str | None:
-    """Stdlib-only copy of the shared scalar contract in utils/prompt_notes.
-
-    This file is vendored into repositories that cannot import the backend.
-    Cross-host tests keep the note-authoring contract identical.
-    """
-    lines = text.strip().removeprefix("\ufeff").splitlines()
-    if not lines or lines[0].strip() != "---":
-        return None
-    try:
-        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
-    except StopIteration:
-        return "on-demand"
-    values = [line.partition(":")[2].split("#", 1)[0].strip()
-              for line in lines[1:end] if line.startswith("prompt:")]
-    if not values:
-        return None
-    if len(values) != 1:
-        return "on-demand"
-    if re.fullmatch(r'''(?:inline|'inline'|"inline")''', values[0]):
-        return "inline"
-    return "on-demand"
-
-
-def _core_candidates(
-    root: Path, *, kind: str = "active soul",
-) -> tuple[list[tuple[str, str, str, str | None]], list[str]]:
-    """Fresh, sorted, owner-contained core reads for both inheritance layers."""
-    candidates: list[tuple[str, str, str, str | None]] = []
-    warnings: list[str] = []
-    core = root / "core"
-    if not core.is_dir():
-        return candidates, warnings
-    resolved_core = _owned_path(core, root)
-    if resolved_core is None:
-        return candidates, [
-            f"CRITICAL: {kind} core directory escaped its vault: {core}",
-        ]
-    try:
-        core_paths = sorted(resolved_core.rglob("*.md"))
-    except OSError as exc:
-        return candidates, [
-            f"CRITICAL: {kind} core could not be enumerated: {core} ({exc})",
-        ]
-    for path in core_paths:
-        if path.name.startswith(_SKIP_PREFIXES):
-            continue
-        rel = path.relative_to(root.resolve()).as_posix()
-        label = f"shared {rel}" if kind == "shared soul" else rel
-        body = _read(path, owner_root=root)
-        if kind == "shared soul" and body and _prompt_mode(body) != "inline":
-            body = f"On-demand note. Read `{path}` when needed."
-        candidates.append((
-            label,
-            str(path),
-            body,
-            f"CRITICAL: {kind} core note is unavailable or outside its vault: {path}",
-        ))
-    return candidates, warnings
-
-
 def _project_overlay(repo_root: Path) -> tuple[str, list[str]]:
     brief_path = repo_root / "PROJECT_BRIEF.md"
     brief = _read(brief_path)
@@ -842,19 +686,23 @@ def _project_overlay(repo_root: Path) -> tuple[str, list[str]]:
     )
 
 
-def _coop_brief(repo_root: Path, agent: str) -> tuple[str, list[str]]:
+def _coop_brief(
+    repo_root: Path, agent: str, deadline: float | None = None,
+) -> tuple[str, list[str]]:
     """Perform the letter-read ritual, then load the read-only session card.
 
     Both commands use the generated client, so an adopted ledger's read
     transition belongs to the office. Starting or completing work is separate.
     Keep successful letter output even if the following brief cannot load.
+    Reading marks a letter read, so this runs only after identity loaded.
     """
     client = repo_root / "tools" / "coop" / "coop.py"
     if not client.is_file():
         return "", [f"COOP BRIEF UNAVAILABLE: client missing: {client}"]
     parts: list[str] = []
     warnings: list[str] = []
-    deadline = time.monotonic() + 20
+    own_deadline = time.monotonic() + _COOP_DEADLINE_SECONDS
+    deadline = own_deadline if deadline is None else min(deadline, own_deadline)
     for command, label, failure in (
         (["letter", "read"], "Coop handoff letters", "COOP LETTERS UNAVAILABLE"),
         (["brief"], "live Coop session card", "COOP BRIEF UNAVAILABLE"),
@@ -863,7 +711,7 @@ def _coop_brief(repo_root: Path, agent: str) -> tuple[str, list[str]]:
         try:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise subprocess.TimeoutExpired(argv, 20)
+                raise subprocess.TimeoutExpired(argv, _COOP_DEADLINE_SECONDS)
             proc = subprocess.run(
                 argv, cwd=repo_root, capture_output=True, text=True, timeout=remaining,
             )
@@ -927,7 +775,7 @@ def _split_section(section: str) -> tuple[str, str, str]:
 def _demotable(section: str) -> bool:
     label, source, _body = _split_section(section)
     return (
-        label.startswith(_DEMOTABLE_LABEL_PREFIXES)
+        label.startswith(_DEMOTABLE_LABEL_PREFIX)
         and bool(source)
         and Path(source).is_absolute()
     )
@@ -935,7 +783,7 @@ def _demotable(section: str) -> bool:
 
 def _read_first_block(demoted: list[tuple[str, str, int]]) -> str:
     lines = [
-        "--- always-on self not inlined (host limit) ---",
+        "--- project overlay not inlined (host limit) ---",
         "Read each one with the Read tool before your first reply, in this order:",
     ]
     for index, (label, source, chars) in enumerate(demoted, start=1):
@@ -953,52 +801,37 @@ def _assemble(
     limit: int | None,
     coop_read_first: str = "",
 ) -> str:
+    # Both read-first pointers come straight after the header, ahead of
+    # everything a last-resort cut may take.
     parts = [header]
     if coop_read_first:
         parts.append(coop_read_first)
-    if warnings:
-        parts.append("--- bootstrap warnings ---\n" + "\n".join(warnings))
     if demoted and limit is not None:
         parts.append(_read_first_block(demoted))
+    if warnings:
+        parts.append("--- bootstrap warnings ---\n" + "\n".join(warnings))
     parts.extend(sections)
     if coop:
         parts.append(coop)
-    parts.append("</forrest-terminal-context>")
+    parts.append(_CONTEXT_CLOSE)
     return "\n\n".join(parts)
-
-
-_BODY_LAYERS = ("PROJECT_BRIEF.md", "shared core/")
-_SOUL_CORE_LAYER = ("core/",)
-
-
-def _next_demotion(sections: list[str], layers: tuple[str, ...]) -> int | None:
-    """The section to demote next: the last of the first layer that still has one."""
-    for prefix in layers:
-        for index in range(len(sections) - 1, -1, -1):
-            if not _demotable(sections[index]):
-                continue
-            label, _source, _body = _split_section(sections[index])
-            if label.startswith(prefix):
-                return index
-    return None
 
 
 def _fit_host_context(
     agent: str,
+    card: str,
     header: str,
     warnings: list[str],
     sections: list[str],
     coop: str,
 ) -> str:
-    """Keep the bootstrap inside what the host actually injects.
+    """Fit the hook's own context into what the host injects behind the card.
 
-    The project overlay yields first, then shared core notes, then the Coop
-    context to a complete read-first file, and the Soul's own core only last
-    (Soul L4: "영혼 자기 core는 늘 통째로 실려"; the terminal reads what the host
-    cannot carry).
-    Each demoted file is named in a read-first block placed before the inline
-    sections so that even a preview still carries the map. The Soul entry,
-    registry, shared boundary, and instructions stay inline.
+    The card is the client's text. It rides first and whole and is never
+    clipped, demoted or reordered, so only what this hook owns yields: the
+    project overlay first, named in a read-first block, then the Coop context,
+    kept complete in a read-first file. Both pointers sit before the inline
+    sections. The header and the registry coordinates stay inline.
     """
     limit = _HOST_CONTEXT_MAX_CHARS.get(agent)
     demoted: list[tuple[str, str, int]] = []
@@ -1010,7 +843,10 @@ def _fit_host_context(
             header, warnings, demoted, sections, coop, limit=None,
             coop_read_first=coop_read_first,
         )
-    budget = limit - _HOST_CONTEXT_MARGIN_CHARS
+    # What the card leaves of the host's window, less the newline that
+    # separates the context from it and the one that ends the output.
+    room = limit - _host_chars(card) - 2
+    budget = room - _HOST_CONTEXT_MARGIN_CHARS
     sections = list(sections)
 
     def current() -> str:
@@ -1019,58 +855,56 @@ def _fit_host_context(
             coop_read_first=coop_read_first,
         )
 
-    def demote(layers: tuple[str, ...]) -> None:
-        while _host_chars(current()) > budget:
-            index = _next_demotion(sections, layers)
-            if index is None:
-                return
-            label, source, body = _split_section(sections[index])
-            demoted.insert(0, (label, source, len(body)))
-            del sections[index]
-
-    demote(_BODY_LAYERS)
-    # A short card costs less than its recovery pointer; keep it inline while
-    # demoting the remaining file-backed identity sections.
+    while _host_chars(current()) > budget:
+        index = next(
+            (i for i in range(len(sections) - 1, -1, -1) if _demotable(sections[i])),
+            None,
+        )
+        if index is None:
+            break
+        label, source, body = _split_section(sections[index])
+        demoted.insert(0, (label, source, len(body)))
+        del sections[index]
+    # A short Coop card costs less than its recovery pointer; keep it inline.
     if _host_chars(current()) > budget and len(coop) > 512:
         coop_read_first, coop = _preserve_coop_context(coop, agent), ""
-    demote(_SOUL_CORE_LAYER)
-    if _host_chars(current()) > limit and coop:
+    if _host_chars(current()) > room and coop:
         coop_read_first, coop = _preserve_coop_context(coop, agent), ""
     rendered = current()
-    if _host_chars(rendered) > limit:
+    if _host_chars(rendered) > room:
         # Last resort: never hand the host something it will replace with a
-        # preview. The cut is visible and names where the rest lives.
-        closer = "\n\n[bounded at the host limit; read instructions.md and core/ from the vault]\n\n</forrest-terminal-context>"
-        rendered = rendered[: limit - len(closer)].rstrip() + closer
+        # preview. The visible cut takes the tail of the hook's own text and
+        # never a read-first pointer: a letter already marked read is reachable
+        # only through its pointer. When the card leaves no room for the
+        # header and the pointers, nothing is cut and the output goes whole
+        # into the file the host keeps for it, card first.
+        closer = f"\n\n[bounded at the host limit]\n\n{_CONTEXT_CLOSE}"
+        pointers = _assemble(
+            header, [], demoted, [], "", limit=limit, coop_read_first=coop_read_first,
+        )
+        keep = room - len(closer)
+        if keep >= len(pointers) - len(_CONTEXT_CLOSE):
+            rendered = rendered[:keep].rstrip() + closer
     return rendered
 
 
-def render(agent: str, repo_root: Path, *, body: str = "registered-app") -> str:
-    coop, coop_warnings = _coop_brief(repo_root, agent)
-    (
-        vault,
-        configured_soul,
-        soul_profile,
-        shared_instructions,
-        shared_root,
-        identity_source,
-        warnings,
-    ) = _identity_source()
-    identity, identity_warnings = _identity_sections(
-        vault,
-        configured_soul,
-        soul_profile,
-        shared_instructions,
-        shared_root,
-    )
-    warnings.extend(identity_warnings)
-    warnings.extend(coop_warnings)
+def _body_context(
+    agent: str,
+    repo_root: Path,
+    body: str,
+    card: str,
+    profile: dict[str, str] | None,
+    profile_source: str,
+    warnings: list[str],
+    deadline: float,
+) -> str:
+    """What the hook itself owns, fitted behind an identity card that loaded."""
     overlay = ""
     if body == "root":
         standing = f"""This is Forrest's terminal channel for the general development body at {repo_root}.
 
-- Repository instructions and engineering notes are body overlays; the
-  selected Soul vault below is the identity owner.
+- Repository instructions and engineering notes are body overlays; the Soul
+  loaded by the card above is the identity owner.
 - This body is not a registered Git development body and has no PROJECT_BRIEF
   or project binder."""
     elif body == "registered-app":
@@ -1109,24 +943,70 @@ Forrest still works here with you, but the binder is gone:
     host_limit = _HOST_CONTEXT_MAX_CHARS.get(agent)
     host_line = (
         f"\n- Host limit: {agent} keeps at most {host_limit:,} characters of this"
-        "\n  bootstrap in context; always-on files that do not fit are listed"
-        "\n  first for you to Read before your first reply."
+        "\n  bootstrap in context; the card rides whole, and what else does not"
+        "\n  fit is named for you to Read before your first reply."
         if host_limit is not None
         else ""
     )
-    # A bootstrap catalog (Memory L1): where the identity below came from and
-    # what this host keeps. The isolation and Coop rules live in CLAUDE.md and
-    # the shared boundary, which is inlined below.
+    # A bootstrap catalog (Memory L1): where identity came from and what this
+    # host keeps. The isolation and Coop rules live in CLAUDE.md and in the
+    # shared boundary, which the identity bundle carries.
     header = f"""<forrest-terminal-context>
 {standing}
 
-- Soul vault {vault} (read fresh); identity pointers from {identity_source}.
+- Identity: the Soul Vault card above; registry coordinates from {profile_source}.
 - Agent surface: {agent}{host_line}
 """.rstrip()
-    sections = list(identity)
+    sections: list[str] = []
+    if profile is not None:
+        sections.append(
+            "--- Soul registry — canonical routing identity "
+            "(runtime canonical registry projection) ---\n"
+            f"soul_id: {profile['soul_id']}\n"
+            f"display_name: {profile['display_name']}"
+        )
     if overlay:
         sections.append(overlay)
-    return _fit_host_context(agent, header, warnings, sections, coop)
+    # Last, so nothing above can fail after a handoff letter was marked read.
+    coop, coop_warnings = _coop_brief(repo_root, agent, deadline)
+    warnings.extend(coop_warnings)
+    return _fit_host_context(agent, card, header, warnings, sections, coop)
+
+
+def render(
+    agent: str,
+    repo_root: Path,
+    *,
+    body: str = "registered-app",
+    notices: list[str] | None = None,
+) -> str:
+    """Everything SessionStart prints: the refusal alone, or the card and then the body.
+
+    ``notices`` are the caller's own warnings about the hook payload. They
+    join the body's warnings behind a card and are dropped with a refusal,
+    which is printed alone.
+    """
+    deadline = time.monotonic() + _HOOK_DEADLINE_SECONDS
+    try:
+        card, profile, profile_source, warnings = _identity_card(agent)
+    except _IdentityRefused as refused:
+        return refused.text(agent)
+    except Exception as exc:  # a defect is the refusal too, never a session without identity
+        return _IdentityRefused("internal_error", f"{type(exc).__name__}: {exc}").text(agent)
+    try:
+        context = _body_context(
+            agent, repo_root, body, card, profile, profile_source,
+            [*(notices or []), *warnings], deadline,
+        )
+    except Exception as exc:  # the body's own context stays fail-open behind the card
+        context = (
+            "<forrest-terminal-context>\n"
+            f"FORREST SESSION CONTEXT UNAVAILABLE: {exc}\n"
+            "Identity loaded above. Do not assume the body overlay or Coop context loaded.\n"
+            "</forrest-terminal-context>"
+        )
+    return f"{card}\n{context}\n"
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -1153,11 +1033,16 @@ def main() -> int:
             return 2
         print("Forrest integration verified")
         return 0
+    if hasattr(sys.stdout, "reconfigure"):
+        # The card carries the identity note as the client wrote it: UTF-8,
+        # whatever the session's locale.
+        sys.stdout.reconfigure(encoding="utf-8")
+    notices: list[str] = []
     try:
         hook_payload = _read_hook_payload()
     except Exception as exc:
         hook_payload = {}
-        print(f"FORREST SESSION PAYLOAD UNAVAILABLE: {exc}")
+        notices.append(f"FORREST SESSION PAYLOAD UNAVAILABLE: {exc}")
     event_name = (
         _payload_text(hook_payload, "hook_event_name", "hookEventName")
         or "SessionStart"
@@ -1170,19 +1055,13 @@ def main() -> int:
     try:
         _record_managed_session_identity(hook_payload)
     except Exception as exc:
-        # SessionStart remains fail-open. A missing identity proof disables
-        # exact conversation resume, so Forrest opens a new model turn instead
-        # of guessing `--last`/`--continue`.
-        print(f"FORREST MANAGED SESSION ID UNAVAILABLE: {exc}")
-    try:
-        print(render(str(args.agent), repo_root, body=str(args.body)))
-    except Exception as exc:  # SessionStart must remain fail-open.
-        print(
-            "<forrest-terminal-context>\n"
-            f"FORREST SESSION BOOTSTRAP UNAVAILABLE: {exc}\n"
-            "Open the terminal, but do not assume identity or Coop context loaded.\n"
-            "</forrest-terminal-context>"
-        )
+        # The managed session record remains fail-open. A missing record
+        # disables exact conversation resume, so Forrest opens a new model
+        # turn instead of guessing `--last`/`--continue`.
+        notices.append(f"FORREST MANAGED SESSION ID UNAVAILABLE: {exc}")
+    sys.stdout.write(
+        render(str(args.agent), repo_root, body=str(args.body), notices=notices),
+    )
     return 0
 
 

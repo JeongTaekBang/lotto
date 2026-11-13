@@ -10,8 +10,10 @@ read-only project view into each connected conversation.
 
 Each requesting conversation owns its immutable `soul_id`. Git registration
 does not create a representative home. Existing managed WorkUnits keep their
-pinned Soul for recovery; the terminal reads only that selected Soul vault
-plus this project's bounded brief at SessionStart. Editable `source_ref` text
+pinned Soul for recovery; the terminal loads only that selected Soul's
+identity card through Soul Vault plus this project's bounded brief at
+SessionStart (a first line `identity not loaded: <code>: <cause>` means stop
+and give the owner that line). Editable `source_ref` text
 is never identity authority. Without a managed WorkUnit, an
 ordinary terminal uses the current runtime-selected/default Soul and does not
 pin, bind, or adopt project identity.
